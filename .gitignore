@@ -1,0 +1,161 @@
+# Visual Studio Code files
+.vs
+/.vscode/*
+!/.vscode/extensions.json
+!/.vscode/settings_recommended.json
+
+# Editor temporaries
+*.swn
+*.swo
+*.swp
+*.swm
+*~
+
+# Dolphin runtime info
+reorder.dict
+tmp/
+total.code
+total_bpe.dict
+fbank_80dim_cmvn.kaldi
+datum_pb2.py
+lmdb_shard*/
+char_bpe.dict
+rank*cer*txt*
+cer_*txt*
+*.workspace.xml
+
+# Dolphin runtime template dirs
+demo/
+voxceleb2_train/
+stress_prediction/
+nnlm_ez/
+kws_rnnt_train/
+kws_ce_train/
+endpoints/
+dfsmnln_online/
+dfsmnln_online_pretrain/
+exp/
+runs/
+stress_eval/
+tensorboard/
+falconclaw-data/
+dist_init_file*
+
+# Distribution / packaging
+build/
+eggs/
+.eggs/
+*.egg-info/
+lib/
+lib64/
+wheels/
+
+# Compiled Object files
+*.so
+*.o
+
+# Compiled python
+*.pyc
+*.pyd
+__pycache__
+
+# macOS dir files
+.DS_Store
+
+# Idea settings
+.idea
+
+# Binary files
+*.pth
+*.pt
+*.data
+*.index
+*.onnx
+*.wav
+*.jsonl
+*.zip
+*.bin
+*.txt
+!doc/*.txt
+!src/wavtts/infer/examples/*.wav
+!src/wavtts/infer/examples/vocab.txt
+
+# logs
+/**/cruise_logs
+/**/wandb
+/**/lightning_logs
+
+# ipynb ckpts
+.ipynb_checkpoints
+
+# ignore the weekly_test reports
+scripts/weekly_test/report/
+scripts/weekly_test/report_json/
+scripts/weekly_test/Dolphin*.md
+
+# module cache
+.module_cache/
+
+# data directory
+assets/
+# data/
+video/
+seedtts_testset/
+test-clean/
+
+# log directory
+log/
+logs/
+cruise_logs/
+lyrics2song_test/
+
+.history/
+
+span.log
+
+
+durator
+durator2
+recipes/voicebox/testset
+events.*
+
+recipes/text2semantic/custom_scripts/run.sh
+*.log
+resource/
+*.ckpt
+*.csv
+libs/
+generated_output/
+pypetrel.1.0.0.129/
+bm_inference.pstats
+recipes/bigmusic/tests/data/
+recipes/leadsheet
+.attach_*
+*.ipynb
+scripts_usr
+.deploy_cache
+output
+# src/wavtts/train/runs_emilia/
+.venv/
+.codex
+.claude
+
+stats_*
+
+Emilia_ZH_EN_pinyin/
+LibriSpeech-test-clean/
+data/LibriTTS_100_360_500_char/duration.json
+data/LibriTTS_100_360_500_char/raw.arrow
+
+# local dataset symlinks
+/data/Emilia_ZH_EN_pinyin
+/data/LibriSpeech
+/data/LibriTTS_100_360_500_char
+/data/seedtts_testset
+
+# local dataset symlinks
+/data/Emilia_ZH_EN_pinyin
+/data/Emilia_ZH_EN_hdfs_pinyin
+/data/LibriSpeech
+/data/LibriTTS_100_360_500_char
+/data/seedtts_testset

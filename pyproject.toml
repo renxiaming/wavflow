@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools >= 61.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wavtts"
+version = "1.1.10"
+description = "WavTTS: Towards High-Quality Zero-Shot TTS via Direct Raw Waveform Modeling"
+readme = "README.md"
+license = {text = "MIT License"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "accelerate>=0.33.0",
+    "bitsandbytes>0.37.0; platform_machine!='arm64' and platform_system!='Darwin'",
+    "cached_path",
+    "click",
+    "datasets",
+    "einops>=0.8.2",
+    "ema_pytorch>=0.5.2",
+    "hydra-core>=1.3.2",
+    "huggingface-hub>=0.26.0,<1.0",
+    "lance",
+    "librosa",
+    "pandas",
+    "pyarrow",
+    "matplotlib",
+    "numpy<2.0.0",
+    "pydantic<=2.10.6",
+    "pydub",
+    "protobuf",
+    "pypinyin",
+    "python-dateutil",
+    "rjieba",
+    "safetensors",
+    "soundfile>=0.13.1",
+    "tomli",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "torchcodec",
+    "torchdiffeq",
+    "tqdm",
+    "transformers",
+    "transformers-stream-generator",
+    "unidecode",
+    "urllib3",
+    "wandb",
+    "x-transformers>=1.31.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+eval = [
+    "faster_whisper==0.10.1",
+    "funasr",
+    "jiwer==3.1.0",
+    "modelscope",
+    "zhconv",
+    "zhon",
+]
+
+[project.urls]
+Homepage = "https://github.com/cwx-worst-one/WavTTS"
+
+[project.scripts]
+"wavtts_infer-cli" = "wavtts.infer.infer_cli:main"

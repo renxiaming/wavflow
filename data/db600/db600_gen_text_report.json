@@ -1,0 +1,27 @@
+{
+  "output": "/home/work_nfs20/xmren/code/wavtts3/data/db600/db600.jsonl",
+  "backup": "/home/work_nfs20/xmren/code/wavtts3/data/db600/db600.jsonl.bak_no_gen_text",
+  "seed": 20260917,
+  "records": 280570,
+  "same_text_pairs": 0,
+  "sample": [
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060001",
+      "text": "那些人漂浮在空气中，全身血迹未干，脸上满是凄惨的表情。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060001.wav",
+      "gen_text": "你竟然剽窃他人的科研成果，太不像话啦。"
+    },
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060002",
+      "text": "当他们看见李一和李二时，就会停止飘动，一群群地围上来，露出贪婪的神色。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060002.wav",
+      "gen_text": "子羽长得好看吗？孔子也差点犯了以貌取人的错误。"
+    },
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060003",
+      "text": "小鬼们，都一个个毫不掩饰地朝他们伸出肮脏的小手。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060003.wav",
+      "gen_text": "就算是这里长出了皱纹，都应该保持原样才对哦。"
+    }
+  ]
+}

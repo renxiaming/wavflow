@@ -1,0 +1,41 @@
+{
+  "json_lines_read": 61916,
+  "txt_records_read": 353666,
+  "missing_wav_for_txt_record": 0,
+  "bad_json_lines": 0,
+  "txt_files_read": 618,
+  "jsonl_like_files_read": 4,
+  "total_wavs_found": 280570,
+  "records_written": 280570,
+  "unmatched_wavs": 0,
+  "duplicate_utt_count": 0,
+  "output": "/home/work_nfs20/xmren/code/wavtts3/data/db600/db600.jsonl",
+  "missing_examples": [],
+  "sample_records": [
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060001",
+      "text": "那些人漂浮在空气中，全身血迹未干，脸上满是凄惨的表情。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060001.wav"
+    },
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060002",
+      "text": "当他们看见李一和李二时，就会停止飘动，一群群地围上来，露出贪婪的神色。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060002.wav"
+    },
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060003",
+      "text": "小鬼们，都一个个毫不掩饰地朝他们伸出肮脏的小手。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060003.wav"
+    },
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060004",
+      "text": "她拿水泥块朝他们砸去，直挺挺地穿过那些张开的小手，砸到地上。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060004.wav"
+    },
+    {
+      "utt": "中文多人个性化音色库_L-F001-恐怖女声|060005",
+      "text": "那点钱和吃的落到他们手里，一转眼便被撕碎、咬烂，一点痕迹也不留。",
+      "wav": "/home/work_nfs14/zyzhang/tts_data_0515/中文多人个性化音色库/L-F001-恐怖女声/wav/060005.wav"
+    }
+  ]
+}

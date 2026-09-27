@@ -1,0 +1,107 @@
+hydra:
+  run:
+    dir: ckpts/${model.name}_${model.tokenizer}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datasets:
+  name: Emilia_Lance  # dataset name (used for vocab lookup: data/Emilia_Lance_pinyin/vocab.txt)
+  dataset_type: EmiliaLance  # CustomDataset | CustomDatasetPath | EmiliaLance
+  lance_path: /home/work_nfs23/xmren/lance/emilia_wav_token  # full Emilia Lance index prefix (.co/.li)
+  # lance_path: /home/work_nfs23/xmren/lance/emilia_wav_token_100w  # 1M subset for debug
+  text_index_path: /home/work_nfs23/xmren/lance/emilia_text.db  # recommended for full data
+  text_jsonl_path: /home/work_nfs23/hkxie/data/Emilia/emilia_merged.jsonl  # fallback for small/debug runs
+  load_speech_tokens: false
+  polyphone: true
+  batch_size_per_gpu: 10000  # 8 GPUs, 8 * 19200 = 153,600
+  batch_size_type: frame  # frame | sample
+  max_samples: 64  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
+  num_workers: 1
+
+optim:
+  epochs: 686
+  learning_rate: 7.5e-5
+  num_warmup_updates: 20000  # warmup updates
+  grad_accumulation_steps: 1  # note: updates = steps / grad_accumulation_steps
+  max_grad_norm: 1.0  # gradient clipping
+  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
+
+model:
+  name: WavTTS_Large_spkconcat  # model name
+  tokenizer: pinyin  # tokenizer type (pinyin for bilingual, char for English only)
+  tokenizer_path: null  # if 'custom' tokenizer, define the path want to use (should be vocab.txt)
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -0.8
+    P_std: 0.8
+    t_eps: 0.02
+    latents_scale: 9.0
+    use_aux_mel_loss: True
+    aux_mel_loss_weight: 0.05
+    # BareWave-style training-only representation alignment.
+    use_repa_loss: True
+    repa_loss_weight: 0.005
+    # Python index 19 = the 20th DiT block.
+    repa_layer: 19
+    repa_teacher_model: microsoft/wavlm-base-plus
+    # No layer is set: REPA uses WavLM's final last_hidden_state.
+    repa_teacher_dim: 768
+    repa_alignment_hidden: 512
+    # Refined STFT distance with late VAPA scaling.
+    use_stft_loss: True
+    stft_loss_weight: 0.0008
+    stft_gamma: 1.0
+    stft_eps: 0.01
+    stft_start_update: 60000
+    sample_rate: 16000
+    cond_mode: prefix            # infill (Voicebox 随机段) | prefix (CosyVoice2 前缀 prompt)
+    prefix_drop_prob: 0.5        # prefix: 50% 概率无 prompt (纯无条件)
+    prefix_frac: 0.3             # prefix: 否则随机取 [0, 30%] 前缀当 prompt, loss 覆盖整段有效 wav
+    training_cfg_rate: 0.2       # prefix: 每样本 20% 把 audio prompt+content token+spk 三条件一起清 (独立于 prompt 丢弃)
+    joint_cond_drop_prob: 0.0    # prefix 走 per-sample CFG, 关闭旧 joint/独立丢弃模式
+    audio_drop_prob: 0.0
+    cond_drop_prob: 0.0
+  speaker_embedding:
+    online_extract: True
+    model_path: /home/work_nfs23/xmren/huawei_proj/huawei_streaming_cosyvoice/pretrain_models/CosyVoice2-0.5B/campplus.onnx
+  arch:
+    dim: 1152
+    depth: 28
+    heads: 16
+    dropout: 0.0
+    ff_mult: 4
+    text_dim: 512
+    text_mask_padding: True
+    condition_type: speech_token  # text | speech_token
+    speech_token_num_embeds: 6561
+    speech_token_dim: null
+    speech_token_mask_padding: True
+    speech_token_conv_layers: null
+    speech_token_upsampling: linear
+    speech_token_offset: 0
+    qk_norm: null  # null | rms_norm
+    conv_layers: 4
+    pe_attn_head: null
+    attn_backend: torch  # torch | flash_attn
+    attn_mask_enabled: False
+    checkpoint_activations: False  # recompute activations and save memory for extra compute
+    use_audio_proj: True
+    audio_proj_dim: 1024
+    audio_proj_hidden: 768
+    use_spk_embedding: True
+    spk_embed_dim: 192
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 160    # 160 @16k = 100Hz
+
+ckpts:
+  logger: wandb  # wandb | tensorboard | null
+  wandb_entity: xiamingren91-nwpu  # https://wandb.ai/xiamingren91-nwpu
+  wandb_project: WavTTS_grpo
+  log_samples: True  # infer random sample per save checkpoint. wip, normal to fail with extra long samples
+  save_per_updates: 20000  # save checkpoint per updates 50000
+  keep_last_n_checkpoints: -1  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
+  last_per_updates: 5000  # save last checkpoint per updates 5000
+  exp_name: ${model.name}_${model.tokenizer}_${datasets.name}_xpred_vloss_repa_dit20_stft_vapa60k
+  save_dir: ckpts/${model.name}_${model.tokenizer}_${datasets.name}_xpred_vloss_repa_dit20_stft_vapa60k

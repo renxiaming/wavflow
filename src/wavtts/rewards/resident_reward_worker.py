@@ -94,6 +94,42 @@ def score_sim(model, items: list[dict], device: str) -> dict[str, float]:
     return values
 
 
+def load_mos_model(device: str):
+    import torch
+
+    repo = os.environ.get("UTMOS_HUB_REPO", "tarepan/SpeechMOS:v1.2.0")
+    checkpoint = os.environ.get("UTMOS_CHECKPOINT")
+    hub_kwargs = {"source": "local"} if Path(repo).expanduser().is_dir() else {}
+    if checkpoint:
+        model = torch.hub.load(
+            repo, "utmos22_strong", pretrained=False, trust_repo=True, **hub_kwargs
+        )
+        state = torch.load(checkpoint, map_location="cpu")
+        model.load_state_dict(state)
+    else:
+        model = torch.hub.load(repo, "utmos22_strong", trust_repo=True, **hub_kwargs)
+    return model.eval().to(device)
+
+
+def score_mos(model, items: list[dict], device: str) -> dict[str, float]:
+    import soundfile as sf
+    import torch
+
+    values = {}
+    for item in items:
+        wave, sample_rate = sf.read(item["generated_path"], always_2d=False)
+        wave = torch.as_tensor(wave, dtype=torch.float32)
+        if wave.ndim == 2:
+            wave = wave.mean(dim=1)
+        if wave.numel() == 0:
+            values[item["sample_id"]] = 1.0
+            continue
+        with torch.no_grad():
+            score = model(wave.unsqueeze(0).to(device), int(sample_rate))
+        values[item["sample_id"]] = float(score.squeeze().item())
+    return values
+
+
 def load_wer_model(sim_root: Path, language: str, device: str):
     if str(sim_root) not in sys.path:
         sys.path.insert(0, str(sim_root))
@@ -195,8 +231,8 @@ def score_wer(model_bundle, items: list[dict], language: str, device: str) -> di
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Resident WER/SIM reward worker.")
-    parser.add_argument("--mode", choices=["sim", "wer"], required=True)
+    parser = argparse.ArgumentParser(description="Resident WER/SIM/MOS reward worker.")
+    parser.add_argument("--mode", choices=["sim", "wer", "mos"], required=True)
     parser.add_argument("--language", choices=["zh", "en"], default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -213,6 +249,8 @@ def main():
 
     if args.mode == "sim":
         model = load_sim_model(sim_root, device)
+    elif args.mode == "mos":
+        model = load_mos_model(device)
     else:
         if args.language is None:
             raise ValueError("--language is required when --mode=wer")
@@ -232,6 +270,8 @@ def main():
             items = request.get("items", [])
             if args.mode == "sim":
                 values = score_sim(model, items, device)
+            elif args.mode == "mos":
+                values = score_mos(model, items, device)
             else:
                 values = score_wer(model, items, args.language, device)
             emit({"id": request.get("id"), "ok": True, "values": values})

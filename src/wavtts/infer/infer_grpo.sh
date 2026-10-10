@@ -11,17 +11,19 @@ export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 MODEL_CFG="${MODEL_CFG:-${PROJECT_ROOT}/src/wavtts/configs/WavTTS_xpred_spkconcat_flow_grpo.yaml}"
 JSONL="${JSONL:-${PROJECT_ROOT}/data/seed_infer/zh/seedtest_zh_cosyvoice2_tokens_infer.jsonl}"
 CKPT="${GRPO_CKPT:-}"
-CKPT_DIR="${CKPT_DIR:-${PROJECT_ROOT}/result/grpo}"
-CKPT_STEPS="${CKPT_STEPS:-last}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/results/grpo_infer}"
+CKPT_DIR="${CKPT_DIR:-${PROJECT_ROOT}/result/grpo_flowtts_v2}"
+CKPT_STEPS="${CKPT_STEPS:-800,1200,1600,2000}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/results/grpo_flowtts_v2}"
 GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
 PROCS_PER_GPU="${PROCS_PER_GPU:-4}"
 SAMPLER="${SAMPLER:-ode}"
 MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
 COMPUTE_DTYPE="${COMPUTE_DTYPE:-bf16}"
-STEPS="${STEPS:-${NFE_STEP:-20,30}}"
+STEPS="${STEPS:-${NFE_STEP:-10,20,30}}"
+
+
 NOISE_SCALE="${NOISE_SCALE:-0.05}"
-CFG_STRENGTH="${CFG_STRENGTH:-1.5,2}"
+CFG_STRENGTH="${CFG_STRENGTH:-1,1.5,2.0}"
 TIMESTEP_MAPPING="${TIMESTEP_MAPPING:-power}"
 TIMESTEP_POWER="${TIMESTEP_POWER:-2.0}"
 SHIFT="${SHIFT:-3.0}"
@@ -33,9 +35,9 @@ PROMPT_FRACTION_MIN="${PROMPT_FRACTION_MIN:-0.0}"
 PROMPT_FRACTION_MAX="${PROMPT_FRACTION_MAX:-0.3}"
 PREFIX_SEED="${PREFIX_SEED:-666}"
 LANGUAGE="${LANGUAGE:-zh}"
-RUN_SIM="${RUN_SIM:-1}"
+RUN_SIM="${RUN_SIM:-0}"
 SIM_SCRIPT="${SIM_SCRIPT:-/home/A02_tmpdata0/wenhaoli/code/seed_eval/run_sim.sh}"
-SIM_OUTPUT_DIR="${SIM_OUTPUT_DIR:-${PROJECT_ROOT}/results/sim/zh}"
+SIM_OUTPUT_DIR="${SIM_OUTPUT_DIR:-${PROJECT_ROOT}/results/sim/flowtts_v2}"
 SIM_TARGET_SPK="${SIM_TARGET_SPK:-/home/A02_tmpdata0/wenhaoli/data/test_seed_dir/zh}"
 SIM_DEVICE="${SIM_DEVICE:-7}"
 DRY_RUN=0
@@ -47,7 +49,7 @@ Usage:
 
 This launches one worker per process, shards JSONL rows, and writes every
 checkpoint/steps/cfg combination into its own output directory. Speaker
-similarity evaluation runs after each inference case by default.
+similarity evaluation is optional and disabled by default.
 
 Options:
   --ckpt PATH              One GRPO checkpoint (compatibility mode).

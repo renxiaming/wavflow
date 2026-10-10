@@ -16,6 +16,7 @@ class FlowGRPORollout:
     times: torch.Tensor
     dts: torch.Tensor
     stds: torch.Tensor
+    stochastic_mask: torch.Tensor
     noise_scale: float
     action_mask: torch.Tensor
     cond_mask: torch.Tensor
@@ -24,6 +25,10 @@ class FlowGRPORollout:
     step_cond: torch.Tensor
     durations: torch.Tensor
     final: torch.Tensor
+
+    @property
+    def train_step_indices(self) -> list[int]:
+        return torch.nonzero(self.stochastic_mask, as_tuple=False).flatten().tolist()
 
 
 def _time_grid(
@@ -111,11 +116,12 @@ def _sde_transition_mean(
     dt_sigma: torch.Tensor,
     sigma_t: torch.Tensor,
     noise_scale: float,
+    stochastic: bool = True,
 ) -> torch.Tensor:
     """Compute the Gaussian transition mean used by rollout and replay."""
     state = state.float()
     velocity = velocity.float()
-    if noise_scale == 0:
+    if noise_scale == 0 or not stochastic:
         return state + dts[step_index].float() * velocity
 
     sigma_value = sigma[step_index].float()
@@ -161,17 +167,17 @@ def rollout_log_probs(
     rollout: FlowGRPORollout,
 ) -> torch.Tensor:
     """Compute exact old-policy log-probs from the sampled transition means."""
-    return torch.stack(
-        [
-            _gaussian_log_prob(action, mean, std, rollout.action_mask)
-            for action, mean, std in zip(
-                rollout.actions,
-                rollout.transition_means,
-                rollout.stds,
-            )
-        ],
-        dim=0,
-    )
+    values = []
+    for step_index, (action, mean, std) in enumerate(zip(
+        rollout.actions,
+        rollout.transition_means,
+        rollout.stds,
+    )):
+        if bool(rollout.stochastic_mask[step_index]):
+            values.append(_gaussian_log_prob(action, mean, std, rollout.action_mask))
+        else:
+            values.append(torch.zeros(action.shape[0], device=action.device, dtype=torch.float32))
+    return torch.stack(values, dim=0)
 
 
 def _to_velocity(model, raw_pred: torch.Tensor, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
@@ -306,6 +312,8 @@ def rollout_sde(
     timestep_power: float | None = None,
     sway_sampling_coef: float | None = None,
     shift: float = 1.0,
+    sde_window_start: int | None = None,
+    sde_window_size: int | None = None,
 ) -> FlowGRPORollout:
     inputs = prepare_flow_inputs(
         model,
@@ -336,6 +344,18 @@ def rollout_sde(
     # sigma=1 at the start and sigma=0 at the end). This model integrates
     # t=0 -> 1, so sigma is 1-t and dt_sigma=-dt.
     sigma, dt_sigma, sigma_t, stds = _sde_parameters(times, noise_scale)
+    stochastic_mask = torch.ones(steps, device=step_cond.device, dtype=torch.bool)
+    if sde_window_size is not None and int(sde_window_size) > 0:
+        window_size = int(sde_window_size)
+        window_start = 0 if sde_window_start is None else int(sde_window_start)
+        if window_start < 0 or window_start + window_size > steps:
+            raise ValueError(
+                f"SDE window [{window_start}, {window_start + window_size}) is invalid "
+                f"for {steps} rollout steps."
+            )
+        stochastic_mask.zero_()
+        stochastic_mask[window_start : window_start + window_size] = True
+        stds = stds * stochastic_mask.to(stds.dtype)
 
     # Keep the stochastic state and transition arithmetic in fp32. The model
     # itself may still run under bf16 autocast.
@@ -376,6 +396,7 @@ def rollout_sde(
             dt_sigma=dt_sigma,
             sigma_t=sigma_t,
             noise_scale=noise_scale,
+            stochastic=bool(stochastic_mask[step_idx]),
         )
         transition_means.append(mean.detach())
         action = mean if float(std.item()) == 0.0 else mean + std * torch.randn_like(mean)
@@ -392,6 +413,7 @@ def rollout_sde(
         times=times[:-1],
         dts=dts,
         stds=stds,
+        stochastic_mask=stochastic_mask,
         noise_scale=float(noise_scale),
         action_mask=action_mask,
         cond_mask=cond_mask,
@@ -421,6 +443,11 @@ def replay_log_probs(
         rollout.times,
         rollout.stds,
     )):
+        if not bool(rollout.stochastic_mask[step_idx]):
+            log_probs.append(torch.zeros(state.shape[0], device=state.device, dtype=torch.float32))
+            if return_means:
+                means.append(rollout.transition_means[step_idx])
+            continue
         time = torch.full(
             (state.shape[0],),
             float(time_value.item()),
@@ -447,6 +474,7 @@ def replay_log_probs(
             dt_sigma=dt_sigma,
             sigma_t=sigma_t,
             noise_scale=rollout.noise_scale,
+            stochastic=True,
         )
         log_probs.append(_gaussian_log_prob(action, mean, std, rollout.action_mask))
         if return_means:
@@ -467,6 +495,8 @@ def replay_log_prob_step(
     cfg_strength: float,
     return_mean: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not bool(rollout.stochastic_mask[step_index]):
+        raise ValueError(f"Rollout step {step_index} is deterministic and has no policy log-probability.")
     state = rollout.states[step_index]
     action = rollout.actions[step_index]
     time_value = rollout.times[step_index]
@@ -499,6 +529,7 @@ def replay_log_prob_step(
         dt_sigma=dt_sigma,
         sigma_t=sigma_t,
         noise_scale=rollout.noise_scale,
+        stochastic=True,
     )
     log_prob = _gaussian_log_prob(action, mean, std, rollout.action_mask)
     model.transformer.clear_cache()
@@ -518,6 +549,7 @@ def slice_rollout(rollout: FlowGRPORollout, start: int, end: int) -> FlowGRPORol
         times=rollout.times,
         dts=rollout.dts,
         stds=rollout.stds,
+        stochastic_mask=rollout.stochastic_mask,
         noise_scale=rollout.noise_scale,
         action_mask=rollout.action_mask[start:end],
         cond_mask=rollout.cond_mask[start:end],
@@ -537,7 +569,7 @@ def concatenate_rollouts(rollouts: list[FlowGRPORollout]) -> FlowGRPORollout:
     for rollout in rollouts[1:]:
         if rollout.noise_scale != first.noise_scale:
             raise ValueError("Cannot concatenate rollouts with different noise scales.")
-        for name in ("times", "dts", "stds"):
+        for name in ("times", "dts", "stds", "stochastic_mask"):
             if not torch.equal(getattr(rollout, name), getattr(first, name)):
                 raise ValueError(f"Cannot concatenate rollouts with different {name}.")
     return FlowGRPORollout(
@@ -550,6 +582,7 @@ def concatenate_rollouts(rollouts: list[FlowGRPORollout]) -> FlowGRPORollout:
         times=first.times,
         dts=first.dts,
         stds=first.stds,
+        stochastic_mask=first.stochastic_mask,
         noise_scale=first.noise_scale,
         action_mask=torch.cat([item.action_mask for item in rollouts], dim=0),
         cond_mask=torch.cat([item.cond_mask for item in rollouts], dim=0),

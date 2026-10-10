@@ -1,11 +1,11 @@
 datasets:
-  name: GRPO_SELF_PREFIX_JSONL
+  name: GRPO_PROMPT_TARGET_JSONL
   dataset_type: JsonlSelfPrefix
   jsonl_path: /home/A02_tmpdata0/xmren/code/grpo_flow/wavtts3.1_grpo/data/grpo_seed/zh/seedtest_zh_cosyvoice2_tokens.jsonl
   load_speech_tokens: true
   speech_token_rate: 25.0
   # This is consumed by train_grpo as a per-GPU rollout/replay frame budget.
-  batch_size_per_gpu: 40000
+  batch_size_per_gpu: 80000
   batch_size_type: frame
   max_samples: 64
   num_workers: 1
@@ -21,29 +21,30 @@ model:
   backbone: DiT
   cfm:
     prediction: x_pred
-    loss_space: x
+    # The network predicts x0, while the supervised preservation anchor is
+    # optimized in velocity space to match the original SFT recipe.
+    loss_space: v
     t_sampling: uniform
     P_mean: -0.8
     P_std: 0.8
     t_eps: 0.02
     latents_scale: 9.0
-    use_aux_mel_loss: false
-    aux_mel_loss_weight: 0.0
-    use_repa_loss: false
-    repa_loss_weight: 0.0
-    repa_layer: -1
-    repa_teacher_model: null
-    repa_teacher_layer: 6
+    use_aux_mel_loss: true
+    aux_mel_loss_weight: 0.05
+    use_repa_loss: true
+    repa_loss_weight: 0.005
+    repa_layer: 17
+    repa_teacher_model: /home/A02_tmpdata0/xmren/code/grpo_flow/wavtts3.1_grpo/portable_wavtts_grpo/pretrain_models/grpo_rewards/wavlm-base-plus
     repa_teacher_dim: 768
     repa_alignment_hidden: 512
-    use_stft_loss: false
-    stft_loss_weight: 0.0
+    use_stft_loss: true
+    stft_loss_weight: 0.0008
     stft_gamma: 1.0
     stft_eps: 0.01
     stft_start_update: 0
     sample_rate: 16000
     cond_mode: prefix
-    # GRPO samples this range explicitly and masks policy loss to the suffix.
+    # GRPO conditions on the full prompt audio and masks policy loss to the target.
     prefix_drop_prob: 0.0
     prefix_frac: 0.3
     prefix_loss_on_suffix_only: true
@@ -97,51 +98,60 @@ ckpts:
 grpo:
   init_ckpt: /home/A02_tmpdata0/xmren/code/grpo_flow/wavtts3.1_grpo/portable_wavtts_grpo/ckpts/model_80000.pt
   jsonl: /home/A02_tmpdata0/xmren/code/grpo_flow/wavtts3.1_grpo/data/grpo_seed/zh/seedtest_zh_cosyvoice2_tokens.jsonl
-  output_dir: ./exp/nar_wav_tts_flow_grpo_xpred_prefix
-  data_mode: self_prefix
+  output_dir: ./result/grpo_flowtts_v2
+  data_mode: paired
   prompt_fraction_min: 0.0
   prompt_fraction_max: 0.3
   # At least three samples are rolled out together on the default utterance
   # lengths; lower this only if the rollout GPU runs out of memory.
-  batch_size_frames: 30000
+  batch_size_frames: 80000
   reward_backend: resident
   reward_root: /home/A02_tmpdata0/xmren/code/grpo_flow/wavtts3.1_grpo/portable_wavtts_grpo/third_party/sim_wer_test
   reward_server_host: 127.0.0.1
   reward_server_port: 29631
-  group_size: 24
-  ppo_epochs: 1
-  train_timestep_fraction: 0.99
-  learning_rate: 5.0e-6
+  group_size: 40
+  prompts_per_update: 6
+  ppo_epochs: 2
+  train_timestep_fraction: 1.0
+  learning_rate: 5.0e-5
+  lr_scheduler: linear
   max_grad_norm: 1.0
-  clip_eps: 0.001
+  clip_eps: 0.0001
   adv_clip_max: 5.0
-  kl_coef: 0.04
-  noise_scale: 0.1
-  steps: 10
-  # Original official Flow-GRPO SD3 config uses CFG. The paper itself does not
-  # specify a CFG switch; set use_cfg=false for the later Flow-GRPO-Fast variant.
-  use_cfg: true
-  cfg_strength: 1.5
-  timestep_mapping: power
+  kl_coef: 0.01
+  noise_scale: 0.3
+  # FlowTTS-GRPO uses 8-16 denoising steps and optimizes only a two-step SDE
+  # window; the remaining trajectory is deterministic ODE sampling.
+  steps: 16
+  rollout_steps_min: 8
+  sde_window_size: 2
+  sde_window_start_min: 1
+  sde_window_start_max: 3
+  use_cfg: false
+  cfg_strength: 1.0
+  timestep_mapping: uniform
   timestep_power: 2.0
-  shift: 3.0
+  shift: 1.0
   token_rate: 25.0
-  # SIM compares the complete source utterance with the generated suffix.
-  # WER compares generated suffix ASR with the prompt_text transcript in JSONL.
-  wer_weight: 0.2
-  sim_weight: 0.8
+  # SIM compares the complete prompt wav with the generated target.
+  # WER compares generated target ASR with target_text in the JSONL.
+  # Each component is standardized over the complete rollout batch before
+  # these FlowTTS-GRPO weights are applied.
+  wer_weight: 1.0
+  sim_weight: 1.0
+  mos_weight: 0.4
+  reward_std_eps: 1.0e-4
+  sft_anchor_coef: 0.01
   target_rms: 0.1
   reward_language: zh
   model_dtype: fp32
   compute_dtype: bf16
-  # Full-parameter GRPO fine-tuning is the default. Set use_lora=true or pass
-  # --use-lora to use the optional LoRA adapter path.
   use_lora: false
   lora_rank: 32
   lora_alpha: 64.0
   lora_dropout: 0.0
   lora_targets: attn.to_q,attn.to_k,attn.to_v,attn.to_out.0
-  save_per_updates: 100
-  max_updates: 5000
+  save_per_updates: 200
+  max_updates: 10000
   no_reference: false
   keep_rollouts: true

@@ -159,3 +159,10 @@ data/LibriTTS_100_360_500_char/raw.arrow
 /data/LibriSpeech
 /data/LibriTTS_100_360_500_char
 /data/seedtts_testset
+
+# Local datasets, checkpoints, pretrained weights, and generated outputs
+/db600_1w/
+/result/
+/results/
+/portable_wavtts_grpo/ckpts/
+/portable_wavtts_grpo/pretrain_models/

@@ -52,11 +52,12 @@ class RewardServer(socketserver.ThreadingTCPServer):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Single-card resident WER/SIM reward server.")
+    parser = argparse.ArgumentParser(description="Resident WER/SIM/MOS reward server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=29631)
     parser.add_argument("--sim-device", default="cuda:0")
     parser.add_argument("--wer-device", default="cuda:0")
+    parser.add_argument("--mos-device", default="cuda:0")
     parser.add_argument(
         "--sim-root",
         default=(
@@ -66,25 +67,30 @@ def main():
     )
     parser.add_argument("--sim-python", default=None)
     parser.add_argument("--wer-python", default=None)
+    parser.add_argument("--mos-python", default=None)
     parser.add_argument("--wer-weight", type=float, default=0.2)
     parser.add_argument("--sim-weight", type=float, default=0.8)
+    parser.add_argument("--mos-weight", type=float, default=0.0)
     args = parser.parse_args()
 
     rewarder = SimWerReward(
         device=args.wer_device,
         sim_device=args.sim_device,
         wer_device=args.wer_device,
+        mos_device=args.mos_device,
         sim_root=args.sim_root,
         wer_weight=args.wer_weight,
         sim_weight=args.sim_weight,
+        mos_weight=args.mos_weight,
         backend="resident",
         sim_python=args.sim_python,
         wer_python=args.wer_python,
+        mos_python=args.mos_python,
     )
     server = RewardServer((args.host, args.port), rewarder)
     print(
         f"Reward server listening on {args.host}:{args.port}; "
-        f"sim={args.sim_device} wer={args.wer_device}",
+        f"sim={args.sim_device} wer={args.wer_device} mos={args.mos_device}",
         flush=True,
     )
     try:

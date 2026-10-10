@@ -162,28 +162,7 @@ class PromptTargetJsonl:
             raise KeyError("Each GRPO row needs prompt_token and gen_token/target_token.")
 
         prompt_audio = self._load_audio(prompt_wav_key)
-        prompt_token_count = len(prompt_tokens)
-        prompt_duration = min(
-            _duration_from_tokens(
-                prompt_token_count,
-                token_rate=self.token_rate,
-                sample_rate=self.sample_rate,
-                frame_len=self.frame_len,
-            ),
-            (prompt_audio.numel() // self.frame_len) * self.frame_len,
-        )
-        prompt_token_count = min(
-            prompt_token_count,
-            max(1, round(prompt_duration / self.sample_rate * self.token_rate)),
-        )
-        prompt_duration = _duration_from_tokens(
-            prompt_token_count,
-            token_rate=self.token_rate,
-            sample_rate=self.sample_rate,
-            frame_len=self.frame_len,
-        )
-        prompt_duration = min(prompt_duration, prompt_audio.numel())
-        prompt_duration -= prompt_duration % self.frame_len
+        prompt_duration = (prompt_audio.numel() // self.frame_len) * self.frame_len
         if prompt_duration <= 0:
             raise ValueError(f"Prompt audio is empty after frame alignment: {prompt_wav_key}")
 
@@ -206,7 +185,7 @@ class PromptTargetJsonl:
             "utt": str(row.get("utt", index)),
             "prompt_wav_path": self._path(prompt_wav_key),
             "prompt_wav": prompt_audio[:prompt_duration],
-            "prompt_token": torch.tensor(prompt_tokens[:prompt_token_count], dtype=torch.long),
+            "prompt_token": torch.tensor(prompt_tokens, dtype=torch.long),
             "target_token": torch.tensor(target_tokens, dtype=torch.long),
             "prompt_duration": int(prompt_duration),
             "target_duration": int(target_duration),

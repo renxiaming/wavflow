@@ -57,6 +57,10 @@ def parse_args():
     parser.add_argument("--prompt-fraction-min", type=float, default=0.0)
     parser.add_argument("--prompt-fraction-max", type=float, default=0.3)
     parser.add_argument("--prefix-seed", type=int, default=666)
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Fix generation randomness per global row index for paired checkpoint comparisons.",
+    )
     parser.add_argument("--language", choices=["zh", "en"], default="zh")
     parser.add_argument(
         "--num-shards",
@@ -142,9 +146,14 @@ def main():
                 )
             safe_utt = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task["utt"])).strip("._") or f"sample_{index:06d}"
             wav_path = output_dir / f"{safe_utt}.wav"
+            generation_seed = None if args.seed is None else (args.seed + index * 1_000_003) % (2**63 - 1)
             if wav_path.is_file() and wav_path.stat().st_size > 44:
                 skipped += 1
             else:
+                if generation_seed is not None:
+                    torch.manual_seed(generation_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(generation_seed)
                 prompt_rms = torch.sqrt(torch.mean(raw_prompt.square())).item()
                 prompt_gain = (
                     args.target_rms / max(prompt_rms, 1e-8)
@@ -198,6 +207,7 @@ def main():
                 "prompt_wav": prompt_wav_path,
                 "target_text": target_text,
                 "gen_wav": str(wav_path),
+                "generation_seed": generation_seed,
                 "sampler": args.sampler,
                 "steps": args.steps,
                 "cfg_strength": args.cfg_strength,

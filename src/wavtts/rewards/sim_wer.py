@@ -147,7 +147,7 @@ class _RewardServerClient:
 
 
 class SimWerReward:
-    """WER + speaker-similarity reward using the existing evaluation scripts."""
+    """ASR accuracy, speaker similarity and perceptual MOS rewards."""
 
     def __init__(
         self,
@@ -155,12 +155,14 @@ class SimWerReward:
         device: str = "cuda:0",
         sim_device: str | None = None,
         wer_device: str | None = None,
+        mos_device: str | None = None,
         sim_root: str = (
             "/home/A02_tmpdata0/xmren/code/grpo_flow/wavtts3.1_grpo/"
             "portable_wavtts_grpo/third_party/sim_wer_test"
         ),
         wer_weight: float = 0.2,
         sim_weight: float = 0.8,
+        mos_weight: float = 0.0,
         language: str = "auto",
         backend: str = "resident",
         wer_script: str | None = None,
@@ -169,6 +171,7 @@ class SimWerReward:
         keep_work_dir: bool = False,
         sim_python: str | None = None,
         wer_python: str | None = None,
+        mos_python: str | None = None,
         resident_worker: str | None = None,
         server_host: str = "127.0.0.1",
         server_port: int = 29631,
@@ -177,12 +180,14 @@ class SimWerReward:
         self.device = device
         self.sim_device = sim_device or device
         self.wer_device = wer_device or device
+        self.mos_device = mos_device or device
         self.sim_root = Path(sim_root)
         self.wer_weight = float(wer_weight)
         self.sim_weight = float(sim_weight)
-        if self.wer_weight < 0 or self.sim_weight < 0:
-            raise ValueError("WER and SIM reward weights must be non-negative.")
-        if self.wer_weight == 0 and self.sim_weight == 0:
+        self.mos_weight = float(mos_weight)
+        if self.wer_weight < 0 or self.sim_weight < 0 or self.mos_weight < 0:
+            raise ValueError("Reward weights must be non-negative.")
+        if self.wer_weight == 0 and self.sim_weight == 0 and self.mos_weight == 0:
             raise ValueError("At least one reward weight must be positive.")
         self.language = language
         self.backend = backend
@@ -194,6 +199,7 @@ class SimWerReward:
         self.keep_work_dir = keep_work_dir
         self.sim_python = sim_python or sys.executable
         self.wer_python = wer_python or sys.executable
+        self.mos_python = mos_python or sys.executable
         self.resident_worker = Path(resident_worker or Path(__file__).with_name("resident_reward_worker.py"))
         self._resident_workers: dict[tuple[str, str | None], _ResidentWorker] = {}
         self._server_client = _RewardServerClient(server_host, server_port, server_timeout)
@@ -329,22 +335,43 @@ class SimWerReward:
     def _result_from_metrics(
         wer_values: list[float],
         sim_values: list[float],
+        mos_values: list[float] | None = None,
         *,
         wer_weight: float,
         sim_weight: float,
+        mos_weight: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         wer_tensor = torch.tensor(wer_values, dtype=torch.float32)
         sim_tensor = torch.tensor(sim_values, dtype=torch.float32)
-        wer_reward = torch.exp(-wer_tensor)
-        sim_reward = (sim_tensor + 1.0) * 0.5
-        reward = wer_weight * wer_reward + sim_weight * sim_reward
+        mos_tensor = torch.tensor(
+            mos_values if mos_values is not None else [0.0] * len(wer_values),
+            dtype=torch.float32,
+        )
+        # FlowTTS-GRPO uses ASR accuracy (1-CER/WER), mapped cosine SIM and
+        # the raw MOS predictor output. Cross-objective normalization is done
+        # over the complete distributed rollout batch in train_grpo.py.
+        wer_reward = (1.0 - wer_tensor).clamp(min=0.0, max=1.0)
+        sim_reward = ((sim_tensor + 1.0) * 0.5).clamp(min=0.0, max=1.0)
+        mos_reward = mos_tensor
+        reward = wer_weight * wer_reward + sim_weight * sim_reward + mos_weight * mos_reward
         return {
             "reward": reward,
             "wer": wer_tensor,
             "sim": sim_tensor,
+            "mos": mos_tensor,
             "wer_reward": wer_reward,
             "sim_reward": sim_reward,
+            "mos_reward": mos_reward,
         }
+
+    def _score_mos_resident(self, generated_paths: list[str], sample_ids: list[str]) -> dict[str, float]:
+        if self.mos_weight <= 0:
+            return {sample_id: 0.0 for sample_id in sample_ids}
+        items = [
+            {"sample_id": sample_id, "generated_path": str(Path(path).resolve())}
+            for sample_id, path in zip(sample_ids, generated_paths)
+        ]
+        return self._get_resident_worker("mos").request(items)
 
     def _score_with_scripts(
         self,
@@ -463,11 +490,14 @@ class SimWerReward:
             if missing_wer:
                 raise RuntimeError(f"WER results are missing samples: {missing_wer}")
 
+            mos_values_by_id = self._score_mos_resident(generated_paths, safe_ids)
             return self._result_from_metrics(
                 [wer_values_by_id[safe_id] for safe_id in safe_ids],
                 [sim_values_by_id[safe_id] for safe_id in safe_ids],
+                [mos_values_by_id[safe_id] for safe_id in safe_ids],
                 wer_weight=self.wer_weight,
                 sim_weight=self.sim_weight,
+                mos_weight=self.mos_weight,
             )
         finally:
             if self.keep_work_dir:
@@ -501,11 +531,15 @@ class SimWerReward:
                 sim_values.append(float(F.cosine_similarity(prompt_emb, generated_emb).item()))
             else:
                 sim_values.append(0.0)
+        sample_ids = [f"sample_{i:06d}" for i in range(len(generated_paths))]
+        mos_values = self._score_mos_resident(generated_paths, sample_ids)
         return self._result_from_metrics(
             wer_values,
             sim_values,
+            [mos_values[sample_id] for sample_id in sample_ids],
             wer_weight=self.wer_weight,
             sim_weight=self.sim_weight,
+            mos_weight=self.mos_weight,
         )
 
     def _get_resident_worker(self, mode: str, language: str | None = None) -> _ResidentWorker:
@@ -515,10 +549,18 @@ class SimWerReward:
             worker = _ResidentWorker(
                 mode=mode,
                 language=language,
-                python_executable=self.sim_python if mode == "sim" else self.wer_python,
+                python_executable=(
+                    self.sim_python if mode == "sim"
+                    else self.mos_python if mode == "mos"
+                    else self.wer_python
+                ),
                 worker_script=self.resident_worker,
                 sim_root=self.sim_root,
-                device=self.sim_device if mode == "sim" else self.wer_device,
+                device=(
+                    self.sim_device if mode == "sim"
+                    else self.mos_device if mode == "mos"
+                    else self.wer_device
+                ),
             )
             self._resident_workers[key] = worker
         return worker
@@ -557,6 +599,7 @@ class SimWerReward:
         wer_values: dict[str, dict] = {
             sample_id: {"wer": 0.0} for sample_id in sample_ids
         }
+        mos_values = self._score_mos_resident(generated_paths, sample_ids)
         for language in sorted(set(resolved_languages)) if self.wer_weight > 0 else []:
             items = [
                 {
@@ -576,16 +619,19 @@ class SimWerReward:
 
         missing_sim = [sample_id for sample_id in sample_ids if sample_id not in sim_values]
         missing_wer = [sample_id for sample_id in sample_ids if sample_id not in wer_values]
-        if missing_sim or missing_wer:
+        missing_mos = [sample_id for sample_id in sample_ids if sample_id not in mos_values]
+        if missing_sim or missing_wer or missing_mos:
             raise RuntimeError(
                 f"Resident reward results are incomplete: missing_sim={missing_sim}, "
-                f"missing_wer={missing_wer}"
+                f"missing_wer={missing_wer}, missing_mos={missing_mos}"
             )
         return self._result_from_metrics(
             [float(wer_values[sample_id]["wer"]) for sample_id in sample_ids],
             [float(sim_values[sample_id]) for sample_id in sample_ids],
+            [float(mos_values[sample_id]) for sample_id in sample_ids],
             wer_weight=self.wer_weight,
             sim_weight=self.sim_weight,
+            mos_weight=self.mos_weight,
         )
 
     def close(self):

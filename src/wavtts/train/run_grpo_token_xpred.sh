@@ -6,6 +6,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+GRPO_WEIGHT_ROOT="${PROJECT_ROOT}/portable_wavtts_grpo/pretrain_models/grpo_rewards"
+if [[ -d "${GRPO_WEIGHT_ROOT}/SpeechMOS" ]]; then
+  export UTMOS_HUB_REPO="${UTMOS_HUB_REPO:-${GRPO_WEIGHT_ROOT}/SpeechMOS}"
+fi
+if [[ -f "${GRPO_WEIGHT_ROOT}/utmos/utmos22_strong_step7459_v1.pt" ]]; then
+  export UTMOS_CHECKPOINT="${UTMOS_CHECKPOINT:-${GRPO_WEIGHT_ROOT}/utmos/utmos22_strong_step7459_v1.pt}"
+fi
+
 GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 REWARD_DEVICE="${GRPO_REWARD_DEVICE:-}"
 REWARD_SERVER_HOST="${GRPO_REWARD_SERVER_HOST:-127.0.0.1}"
@@ -13,12 +21,14 @@ REWARD_SERVER_PORT="${GRPO_REWARD_SERVER_PORT:-29631}"
 BACKEND=""
 WER_WEIGHT=""
 SIM_WEIGHT=""
+MOS_WEIGHT=""
 REWARD_ROOT=""
 MODEL_CFG="${PROJECT_ROOT}/src/wavtts/configs/WavTTS_xpred_spkconcat_flow_grpo.yaml"
 INIT_CKPT="${GRPO_INIT_CKPT:-}"
 JSONL="${GRPO_JSONL:-}"
-OUTPUT_DIR="${GRPO_OUTPUT_DIR:-/home/A02_tmpdata0/xmren/code/grpo_flow/wavtts3.1_grpo/result/grpo}"
+OUTPUT_DIR="${GRPO_OUTPUT_DIR:-}"
 KEEP_ROLLOUTS="${GRPO_KEEP_ROLLOUTS:-1}"
+DATA_MODE="${GRPO_DATA_MODE:-}"
 
 usage() {
   cat <<EOF
@@ -32,6 +42,7 @@ Options:
   --reward-server-port P Reward server port, default: ${REWARD_SERVER_PORT}
   --sim-device DEV       Single-process SIM device; DDP resident mode uses each local GPU
   --wer-device DEV       Single-process WER device; DDP resident mode uses each local GPU
+  --mos-device DEV       Single-process MOS device; DDP resident mode uses each local GPU
   --model-cfg PATH       GRPO/SFT Hydra config
   --model-dtype TYPE     Persistent parameter dtype; GRPO requires fp32
   --compute-dtype TYPE   Rollout/replay autocast dtype, default from config
@@ -39,13 +50,19 @@ Options:
   --jsonl PATH           Prompt/target JSONL, default: grpo.jsonl in config
   --output-dir DIR       GRPO checkpoint directory, default: grpo.output_dir in config
   --group-size N         Samples per prompt, default from config
+  --prompts-per-update N Distinct prompts collected before one PPO update
   --batch-size-frames N  Per-GPU rollout/replay frame budget, default from config
-  --data-mode MODE       paired or self_prefix, default from config
+  --data-mode MODE       paired or self_prefix, default: paired/config
   --prompt-fraction-min X Minimum self-prefix fraction, default from config
   --prompt-fraction-max X Maximum self-prefix fraction, default from config
   --steps N              SDE rollout steps, default from config
+  --rollout-steps-min N  Random minimum rollout steps; 0 disables randomization
+  --sde-window-size N    Number of adjacent stochastic/PPO steps
+  --sde-window-start-min N Minimum random SDE-window start index
+  --sde-window-start-max N Maximum random SDE-window start index
   --max-updates N        Training updates, default from config
   --learning-rate X      Optimizer learning rate, default from config
+  --lr-scheduler NAME    constant or linear, default from config
   --max-grad-norm X      Gradient clipping norm, default from config
   --ppo-epochs N         PPO epochs per rollout batch, default from config
   --train-timestep-fraction X Fraction of rollout timesteps used for PPO replay
@@ -68,6 +85,9 @@ Options:
   --lora-targets LIST    Comma-separated LoRA target suffixes
   --wer-weight X         WER reward weight, default from config
   --sim-weight X         Speaker similarity reward weight, default from config
+  --mos-weight X         Perceptual MOS reward weight, default from config
+  --reward-std-eps X     Minimum component std before it contributes
+  --sft-anchor-coef X    Prompt waveform preservation loss coefficient
   --target-rms X         Normalize low-RMS prompt audio, default from config
   --reward-language L    zh, en, or auto; default from config
   --reward-root DIR      SIM/WER project root, default from config or local path
@@ -79,6 +99,7 @@ Options:
   --discard-rollouts      Delete rollout wavs after reward scoring; keep JSONL records
   --sim-python PATH       Python executable for resident SIM worker
   --wer-python PATH       Python executable for resident WER worker
+  --mos-python PATH       Python executable for resident UTMOS worker
   --no-reference          Keep only one policy/forward model per GPU
   --with-reference        Add one frozen reference model per GPU
   -h, --help              Show this help
@@ -94,6 +115,7 @@ while [[ $# -gt 0 ]]; do
     --reward-server-port) REWARD_SERVER_PORT="$2"; shift 2 ;;
     --sim-device) EXTRA_ARGS+=(--sim-device "$2"); shift 2 ;;
     --wer-device) EXTRA_ARGS+=(--wer-device "$2"); shift 2 ;;
+    --mos-device) EXTRA_ARGS+=(--mos-device "$2"); shift 2 ;;
     --model-cfg) MODEL_CFG="$2"; shift 2 ;;
     --model-dtype) EXTRA_ARGS+=(--model-dtype "$2"); shift 2 ;;
     --compute-dtype) EXTRA_ARGS+=(--compute-dtype "$2"); shift 2 ;;
@@ -101,14 +123,20 @@ while [[ $# -gt 0 ]]; do
     --jsonl) JSONL="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --group-size) EXTRA_ARGS+=(--group-size "$2"); shift 2 ;;
+    --prompts-per-update) EXTRA_ARGS+=(--prompts-per-update "$2"); shift 2 ;;
     --batch-size-frame|--batch-size-frames|--batch-size-per-gpu)
       EXTRA_ARGS+=(--batch-size-frames "$2"); shift 2 ;;
-    --data-mode) EXTRA_ARGS+=(--data-mode "$2"); shift 2 ;;
+    --data-mode) DATA_MODE="$2"; shift 2 ;;
     --prompt-fraction-min) EXTRA_ARGS+=(--prompt-fraction-min "$2"); shift 2 ;;
     --prompt-fraction-max) EXTRA_ARGS+=(--prompt-fraction-max "$2"); shift 2 ;;
     --steps) EXTRA_ARGS+=(--steps "$2"); shift 2 ;;
+    --rollout-steps-min) EXTRA_ARGS+=(--rollout-steps-min "$2"); shift 2 ;;
+    --sde-window-size) EXTRA_ARGS+=(--sde-window-size "$2"); shift 2 ;;
+    --sde-window-start-min) EXTRA_ARGS+=(--sde-window-start-min "$2"); shift 2 ;;
+    --sde-window-start-max) EXTRA_ARGS+=(--sde-window-start-max "$2"); shift 2 ;;
     --max-updates) EXTRA_ARGS+=(--max-updates "$2"); shift 2 ;;
     --learning-rate) EXTRA_ARGS+=(--learning-rate "$2"); shift 2 ;;
+    --lr-scheduler) EXTRA_ARGS+=(--lr-scheduler "$2"); shift 2 ;;
     --max-grad-norm) EXTRA_ARGS+=(--max-grad-norm "$2"); shift 2 ;;
     --ppo-epochs) EXTRA_ARGS+=(--ppo-epochs "$2"); shift 2 ;;
     --train-timestep-fraction) EXTRA_ARGS+=(--train-timestep-fraction "$2"); shift 2 ;;
@@ -131,6 +159,9 @@ while [[ $# -gt 0 ]]; do
     --lora-targets) EXTRA_ARGS+=(--lora-targets "$2"); shift 2 ;;
     --wer-weight) WER_WEIGHT="$2"; EXTRA_ARGS+=(--wer-weight "$2"); shift 2 ;;
     --sim-weight) SIM_WEIGHT="$2"; EXTRA_ARGS+=(--sim-weight "$2"); shift 2 ;;
+    --mos-weight) MOS_WEIGHT="$2"; EXTRA_ARGS+=(--mos-weight "$2"); shift 2 ;;
+    --reward-std-eps) EXTRA_ARGS+=(--reward-std-eps "$2"); shift 2 ;;
+    --sft-anchor-coef) EXTRA_ARGS+=(--sft-anchor-coef "$2"); shift 2 ;;
     --target-rms) EXTRA_ARGS+=(--target-rms "$2"); shift 2 ;;
     --reward-language) EXTRA_ARGS+=(--reward-language "$2"); shift 2 ;;
     --reward-root) REWARD_ROOT="$2"; EXTRA_ARGS+=(--reward-root "$2"); shift 2 ;;
@@ -142,6 +173,7 @@ while [[ $# -gt 0 ]]; do
     --discard-rollouts) KEEP_ROLLOUTS=0; shift ;;
     --sim-python) EXTRA_ARGS+=(--sim-python "$2"); shift 2 ;;
     --wer-python) EXTRA_ARGS+=(--wer-python "$2"); shift 2 ;;
+    --mos-python) EXTRA_ARGS+=(--mos-python "$2"); shift 2 ;;
     --no-reference) EXTRA_ARGS+=(--no-reference); shift ;;
     --with-reference) EXTRA_ARGS+=(--with-reference); shift ;;
     -h|--help) usage; exit 0 ;;
@@ -183,7 +215,9 @@ for key, default in (
     ("grpo.output_dir", "./exp/nar_wav_tts_grpo"),
     ("grpo.wer_weight", 0.2),
     ("grpo.sim_weight", 0.8),
+    ("grpo.mos_weight", 0.0),
     ("grpo.reward_root", ""),
+    ("grpo.data_mode", "paired"),
 ):
     value = OmegaConf.select(cfg, key, default=default)
     print("" if value is None else value)
@@ -194,7 +228,15 @@ PY
 [[ -z "${OUTPUT_DIR}" ]] && OUTPUT_DIR="${CFG_DEFAULTS[2]}"
 [[ -z "${WER_WEIGHT}" ]] && WER_WEIGHT="${CFG_DEFAULTS[3]}"
 [[ -z "${SIM_WEIGHT}" ]] && SIM_WEIGHT="${CFG_DEFAULTS[4]}"
-[[ -z "${REWARD_ROOT}" ]] && REWARD_ROOT="${CFG_DEFAULTS[5]}"
+[[ -z "${MOS_WEIGHT}" ]] && MOS_WEIGHT="${CFG_DEFAULTS[5]}"
+[[ -z "${REWARD_ROOT}" ]] && REWARD_ROOT="${CFG_DEFAULTS[6]}"
+[[ -z "${DATA_MODE}" ]] && DATA_MODE="${CFG_DEFAULTS[7]}"
+
+case "${DATA_MODE}" in
+  paired|self_prefix) ;;
+  *) echo "data mode must be paired or self_prefix, got: ${DATA_MODE}" >&2; exit 1 ;;
+esac
+EXTRA_ARGS+=(--data-mode "${DATA_MODE}")
 
 if [[ "${BACKEND}" == "server" ]]; then
   if [[ -z "${REWARD_DEVICE}" ]]; then
@@ -232,8 +274,10 @@ if [[ "${BACKEND}" == "server" ]]; then
       --port "${REWARD_SERVER_PORT}" \
       --sim-device cuda:0 \
       --wer-device cuda:0 \
+      --mos-device cuda:0 \
       --wer-weight "${WER_WEIGHT}" \
       --sim-weight "${SIM_WEIGHT}" \
+      --mos-weight "${MOS_WEIGHT}" \
       --sim-root "${REWARD_ROOT}" \
       >"${OUTPUT_DIR}/reward_server.log" 2>&1 &
   SERVER_PID=$!

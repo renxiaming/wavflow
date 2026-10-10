@@ -71,35 +71,44 @@ The `use_ema = True` might be harmful for early-stage fine-tuned checkpoints. Be
 
 ## 4. Token-to-Wave Flow-GRPO
 
-The self-prefix Flow-GRPO setup uses
-`configs/WavTTS_xpred_spkconcat_flow_grpo.yaml`. Each JSONL row contributes only
-`utt`, `prompt_wav`, and `prompt_token`; paired target fields are ignored. For every update, one
-complete utterance is selected in a reproducibly shuffled order, a frame-aligned prefix is sampled
-from 0-30%, and the remaining suffix is generated. PPO log-probability, clipping, and KL are all
-masked to that suffix.
+The Flow-GRPO setup uses `configs/WavTTS_xpred_spkconcat_flow_grpo.yaml`.
+By default each JSONL row supplies `prompt_wav`, `prompt_token`, `target_token`,
+and `target_text`. The complete frame-aligned prompt wav is the audio condition;
+the model receives `prompt_token + target_token` and generates only the target
+segment. PPO log-probability, clipping, and KL are masked to that target segment.
+SIM compares the generated target to the complete prompt wav, and WER compares
+its ASR transcript to `target_text`.
 
 ```bash
 bash src/wavtts/train/run_grpo_token_xpred.sh \
   --gpus 0,1,2,3,4,5,6,7 \
   --group-size 24 \
-  --batch-size-frames 4000
+  --batch-size-frames 40000
 ```
 
-The official original Flow-GRPO SD3 configuration uses `use_cfg: true`.
-The trainer defaults to full-parameter fine-tuning (`use_lora: false`); LoRA
-with rank 32 and alpha 64 remains available as an opt-in. The defaults are
-`use_cfg: true` and `use_lora: false`. The paper does not state a CFG switch;
-`--no-cfg` selects the later no-CFG Flow-GRPO-Fast setting. Use `--use-lora` to
-opt into LoRA. When CFG is disabled, the trainer forces
-`cfg_strength` to `1.0` so rollout and replay use the same conditional policy.
+The WavTTS preset follows FlowTTS-GRPO's F5 setup: LoRA rank 32/alpha 64,
+8-16 rollout steps, a random two-step SDE/PPO window, no CFG, and linear LR
+decay. WER accuracy, mapped speaker SIM, and UTMOS are standardized separately
+over the complete distributed rollout batch, then fused with weights
+`1.0/1.0/0.4`. The first MOS use downloads the pinned UTMOS v1.2.0 model; set
+`UTMOS_CHECKPOINT` to an existing local weight file to avoid that download.
+
+The manifest has real `prompt_wav` files but no `target_wav`. A low-weight SFT
+anchor therefore reconstructs each complete prompt waveform using the original
+x-pred-to-v objective plus Mel, DiT-WavLM representation alignment, and STFT
+losses. Generated target audio remains trained only through GRPO rewards.
 
 `--group-size` is the number of stochastic completions for one utterance across all GPUs and must
 be divisible by the GPU count. `--batch-size-frames` is a per-GPU rollout/replay microbatch budget;
-it controls memory without changing the GRPO group used for reward normalization. Self-prefix mode
-uses the complete source wav for SIM and the JSONL `prompt_text` transcript for WER. Rollout audio
+it controls memory without changing the GRPO group used for reward normalization. The optional
+`--prompts-per-update` controls how many distinct utterances are collected before one PPO update.
+Each utterance still produces `--group-size` completions; for example, `prompts_per_update=4`
+and `group_size=24` collect 96 rollouts and normalize advantages independently per utterance.
+`--data-mode self_prefix` retains the old 0-30% prompt-prefix/suffix task. Rollout audio
 is kept by default under `output_dir/rollouts/update_XXXXXXXX/`; one record per
 generated wav is appended to the single file `output_dir/rollouts/rollout_metrics.jsonl` with `sim`,
-`wer`, group-level `sim_min`/`sim_max`, reward, advantage, prompt metadata, and the wav path. Use
+`wer`, `mos`, reward, advantage, group-wide reward/SIM/WER/MOS means and standard deviations,
+`sim_min`/`sim_max`, prompt metadata, and the wav path. Use
 `--discard-rollouts` only when disk usage matters.
 
 

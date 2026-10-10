@@ -26,6 +26,7 @@ from wavtts.model.grpo_flow import (
     slice_rollout,
 )
 from wavtts.model.lora import adapter_state_dict, inject_lora, lora_disabled, lora_modules
+from wavtts.model.repa import WavLMTeacher
 from wavtts.model.speaker_embedding import SpeakerEmbeddingExtractor
 from wavtts.model.utils import get_tokenizer
 from wavtts.rewards import SimWerReward
@@ -61,6 +62,7 @@ def build_parser():
     parser.add_argument("--reward-device", default=None)
     parser.add_argument("--sim-device", default=None)
     parser.add_argument("--wer-device", default=None)
+    parser.add_argument("--mos-device", default=None)
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--data-mode", choices=["paired", "self_prefix"], default="paired")
     parser.add_argument("--prompt-fraction-min", type=float, default=0.0)
@@ -76,6 +78,12 @@ def build_parser():
     parser.add_argument("--max-updates", type=int, default=1000)
     parser.add_argument("--save-per-updates", type=int, default=50)
     parser.add_argument("--group-size", type=int, default=4)
+    parser.add_argument(
+        "--prompts-per-update",
+        type=int,
+        default=1,
+        help="Number of distinct prompts rolled out before one PPO update.",
+    )
     parser.add_argument("--ppo-epochs", type=int, default=1)
     parser.add_argument(
         "--train-timestep-fraction",
@@ -84,6 +92,7 @@ def build_parser():
         help="Fraction of rollout timesteps replayed for each PPO update.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--lr-scheduler", choices=["constant", "linear"], default="constant")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument(
@@ -95,6 +104,13 @@ def build_parser():
     parser.add_argument("--kl-coef", type=float, default=0.0)
     parser.add_argument("--noise-scale", type=float, default=0.05)
     parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument(
+        "--rollout-steps-min", type=int, default=0,
+        help="Randomize rollout steps in [min, steps]; 0 keeps a fixed step count.",
+    )
+    parser.add_argument("--sde-window-size", type=int, default=0)
+    parser.add_argument("--sde-window-start-min", type=int, default=0)
+    parser.add_argument("--sde-window-start-max", type=int, default=0)
     cfg_group = parser.add_mutually_exclusive_group()
     cfg_group.add_argument(
         "--use-cfg",
@@ -117,6 +133,12 @@ def build_parser():
     parser.add_argument("--token-rate", type=float, default=25.0)
     parser.add_argument("--wer-weight", type=float, default=0.5)
     parser.add_argument("--sim-weight", type=float, default=0.5)
+    parser.add_argument("--mos-weight", type=float, default=0.0)
+    parser.add_argument("--reward-std-eps", type=float, default=1e-4)
+    parser.add_argument(
+        "--sft-anchor-coef", type=float, default=0.0,
+        help="Weight of prompt-waveform x-pred/v-loss + Mel/REPA/STFT preservation loss.",
+    )
     parser.add_argument(
         "--target-rms",
         type=float,
@@ -132,6 +154,7 @@ def build_parser():
     parser.add_argument("--keep-reward-work", action="store_true")
     parser.add_argument("--sim-python", default=None)
     parser.add_argument("--wer-python", default=None)
+    parser.add_argument("--mos-python", default=None)
     parser.add_argument(
         "--model-dtype",
         choices=["bf16", "fp16", "fp32"],
@@ -221,6 +244,25 @@ def dtype_from_name(name: str) -> torch.dtype:
         "fp16": torch.float16,
         "fp32": torch.float32,
     }[name]
+
+
+def normalize_and_fuse_rewards(
+    components: torch.Tensor,
+    weights: torch.Tensor,
+    eps: float = 1e-4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize each objective over the complete rollout batch, then fuse it."""
+    if components.ndim != 2 or components.shape[1] != weights.numel():
+        raise ValueError("Reward components must be [N, num_weights].")
+    means = components.mean(dim=0)
+    stds = components.std(dim=0, unbiased=False)
+    active = (stds > float(eps)) & (weights != 0)
+    normalized = torch.where(
+        active,
+        (components - means) / stds.clamp_min(float(eps)),
+        torch.zeros_like(components),
+    )
+    return (normalized * weights).sum(dim=1), means, stds
 
 
 def speaker_model_path(config_path: str) -> str | None:
@@ -337,15 +379,7 @@ def model_from_config(config_path: str, device: str, dtype: torch.dtype) -> CFM:
     waveform_kwargs = OmegaConf.to_container(cfg.model.waveform, resolve=True)
     cfm_kwargs = OmegaConf.to_container(cfg.model.cfm, resolve=True)
 
-    # RL uses reward + KL.  These target-waveform auxiliary branches are
-    # intentionally disabled even though the source SFT checkpoint contains
-    # their optional parameters.
-    cfm_kwargs["use_aux_mel_loss"] = False
-    cfm_kwargs["aux_mel_loss_weight"] = 0.0
-    cfm_kwargs["use_repa_loss"] = False
-    cfm_kwargs["repa_loss_weight"] = 0.0
-    cfm_kwargs["use_stft_loss"] = False
-    cfm_kwargs["stft_loss_weight"] = 0.0
+    # Teacher construction belongs to the training entry point, not CFM.
     cfm_kwargs.pop("repa_teacher_model", None)
     cfm_kwargs.pop("repa_teacher_layer", None)
 
@@ -473,6 +507,10 @@ def save_rollout_metrics(
     reward_result: dict[str, torch.Tensor],
     advantages: torch.Tensor,
     global_rewards: torch.Tensor,
+    global_wers: torch.Tensor,
+    global_sims: torch.Tensor,
+    global_mos: torch.Tensor,
+    reward_component_stds: torch.Tensor,
     task: dict,
     output_dir: Path,
     update: int,
@@ -483,11 +521,17 @@ def save_rollout_metrics(
     local_count = len(generated_paths)
     metric_values = {
         key: reward_result[key].detach().float().cpu().tolist()
-        for key in ("reward", "wer", "sim", "wer_reward", "sim_reward")
+        for key in ("reward", "wer", "sim", "mos", "wer_reward", "sim_reward", "mos_reward")
     }
     advantage_values = advantages.detach().float().cpu().tolist()
     group_mean = float(global_rewards.mean().item())
     group_std = float(global_rewards.std(unbiased=False).item())
+    group_wer_mean = float(global_wers.mean().item())
+    group_wer_std = float(global_wers.std(unbiased=False).item())
+    group_sim_mean = float(global_sims.mean().item())
+    group_sim_std = float(global_sims.std(unbiased=False).item())
+    group_mos_mean = float(global_mos.mean().item())
+    group_mos_std = float(global_mos.std(unbiased=False).item())
     local_records = []
     for sample_index, wav_path in enumerate(generated_paths):
         local_records.append(
@@ -509,11 +553,22 @@ def save_rollout_metrics(
                 "reward": float(metric_values["reward"][sample_index]),
                 "wer": float(metric_values["wer"][sample_index]),
                 "sim": float(metric_values["sim"][sample_index]),
+                "mos": float(metric_values["mos"][sample_index]),
                 "wer_reward": float(metric_values["wer_reward"][sample_index]),
                 "sim_reward": float(metric_values["sim_reward"][sample_index]),
+                "mos_reward": float(metric_values["mos_reward"][sample_index]),
                 "advantage": float(advantage_values[sample_index]),
                 "group_reward_mean": group_mean,
                 "group_reward_std": group_std,
+                "group_wer_mean": group_wer_mean,
+                "group_wer_std": group_wer_std,
+                "group_sim_mean": group_sim_mean,
+                "group_sim_std": group_sim_std,
+                "group_mos_mean": group_mos_mean,
+                "group_mos_std": group_mos_std,
+                "batch_wer_reward_std": float(reward_component_stds[0].item()),
+                "batch_sim_reward_std": float(reward_component_stds[1].item()),
+                "batch_mos_reward_std": float(reward_component_stds[2].item()),
             }
         )
 
@@ -574,6 +629,18 @@ def main():
         raise ValueError("Prompt fractions must satisfy 0 <= min <= max < 1.")
     if args.batch_size_frames < 0:
         raise ValueError("--batch-size-frames must be >= 0.")
+    if args.prompts_per_update < 1:
+        raise ValueError("--prompts-per-update must be >= 1.")
+    if args.rollout_steps_min < 0 or args.rollout_steps_min > args.steps:
+        raise ValueError("--rollout-steps-min must be 0 or <= --steps.")
+    if args.sde_window_size < 0:
+        raise ValueError("--sde-window-size must be >= 0.")
+    if args.sde_window_start_min < 0 or args.sde_window_start_max < args.sde_window_start_min:
+        raise ValueError("Invalid SDE window start range.")
+    if args.reward_std_eps <= 0:
+        raise ValueError("--reward-std-eps must be > 0.")
+    if args.sft_anchor_coef < 0:
+        raise ValueError("--sft-anchor-coef must be >= 0.")
     if not 0.0 < args.train_timestep_fraction <= 1.0:
         raise ValueError("--train-timestep-fraction must be in (0, 1].")
     device, rank, local_rank, world_size, is_main = distributed_context(args.device)
@@ -589,9 +656,11 @@ def main():
         reward_device = device
         sim_device = device
         wer_device = device
+        mos_device = device
     else:
         sim_device = args.sim_device
         wer_device = args.wer_device
+        mos_device = args.mos_device
     model_dtype = dtype_from_name(args.model_dtype)
     compute_dtype = dtype_from_name(args.compute_dtype)
     if model_dtype != torch.float32:
@@ -691,6 +760,17 @@ def main():
     optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate)
     if resume_checkpoint is not None and "optimizer_state_dict" in resume_checkpoint:
         optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", args.learning_rate)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=(
+            (lambda step: max(0.0, 1.0 - step / max(1, args.max_updates)))
+            if args.lr_scheduler == "linear"
+            else (lambda step: 1.0)
+        ),
+        last_epoch=start_update - 1,
+    )
     dataset = PromptTargetJsonl(
         args.jsonl,
         sample_rate=int(policy.target_sample_rate),
@@ -703,12 +783,22 @@ def main():
         model_path=speaker_model_path(args.model_cfg),
         sample_rate=int(policy.target_sample_rate),
     )
+    repa_teacher = None
+    cfm_cfg = OmegaConf.load(args.model_cfg).model.cfm
+    if args.sft_anchor_coef > 0 and bool(cfm_cfg.get("use_repa_loss", False)):
+        repa_teacher = WavLMTeacher(
+            model_name=str(cfm_cfg.get("repa_teacher_model", "microsoft/wavlm-base-plus")),
+            layer=cfm_cfg.get("repa_teacher_layer"),
+            sample_rate=int(policy.target_sample_rate),
+        ).to(device).eval()
     rewarder = SimWerReward(
         device=reward_device,
         sim_device=sim_device,
         wer_device=wer_device,
+        mos_device=mos_device,
         wer_weight=args.wer_weight,
         sim_weight=args.sim_weight,
+        mos_weight=args.mos_weight,
         language=args.reward_language,
         backend=args.reward_backend,
         sim_root=args.reward_root,
@@ -716,6 +806,7 @@ def main():
         keep_work_dir=args.keep_reward_work,
         sim_python=args.sim_python,
         wer_python=args.wer_python,
+        mos_python=args.mos_python,
         server_host=args.reward_server_host,
         server_port=args.reward_server_port,
     )
@@ -723,13 +814,15 @@ def main():
     print(
         f"GRPO rank={rank}/{world_size} policy_device={device} "
         f"reward_device={reward_device} sim_device={rewarder.sim_device} "
-        f"wer_device={rewarder.wer_device}",
+        f"wer_device={rewarder.wer_device} mos_device={rewarder.mos_device}",
         flush=True,
     )
     if is_main:
         print(
             f"GRPO rows={len(dataset)} world={world_size} group={args.group_size} "
-            f"local_group={local_samples} steps={args.steps} noise={args.noise_scale} "
+            f"prompts_per_update={args.prompts_per_update} "
+            f"local_group={local_samples} steps=[{args.rollout_steps_min or args.steps},{args.steps}] "
+            f"sde_window={args.sde_window_size} noise={args.noise_scale} "
             f"model_dtype={args.model_dtype} compute_dtype={args.compute_dtype} "
             f"cfg={args.cfg_strength} mapping={args.timestep_mapping} "
             f"power={args.timestep_power} shift={args.shift} "
@@ -737,12 +830,412 @@ def main():
             f"reward_backend={args.reward_backend} data_mode={args.data_mode} "
             f"prefix=[{args.prompt_fraction_min},{args.prompt_fraction_max}] "
             f"batch_frames={args.batch_size_frames} "
-            f"train_timestep_fraction={args.train_timestep_fraction}",
+            f"train_timestep_fraction={args.train_timestep_fraction} "
+            f"reward_weights=({args.wer_weight},{args.sim_weight},{args.mos_weight}) "
+            f"sft_anchor={args.sft_anchor_coef}",
             flush=True,
         )
 
     shuffle_epoch = None
     shuffled_indices: list[int] = []
+
+    def run_multi_prompt_update(update: int, data_indices: list[int]) -> dict:
+        """Collect several prompt groups, then perform one accumulated PPO update."""
+        records = []
+        for data_index in data_indices:
+            raw_task = dataset[data_index]
+            if args.data_mode == "self_prefix":
+                total_duration = int(raw_task["duration"])
+                prefix_len, sampled_fraction = sample_prefix_length(
+                    total_duration,
+                    frame_len=policy.wav_frame_len,
+                    min_fraction=args.prompt_fraction_min,
+                    max_fraction=args.prompt_fraction_max,
+                    seed=args.seed + update * 1_000_003 + data_index,
+                )
+                raw_condition = raw_task["audio"]
+                sequence_tokens = raw_task["speech_token"]
+                reference_audio_path = raw_task["audio_path"]
+                task = {
+                    **raw_task,
+                    "prompt_wav_path": reference_audio_path,
+                    "prompt_wav": raw_condition,
+                    "prompt_duration": prefix_len,
+                    "target_duration": total_duration - prefix_len,
+                    "total_duration": total_duration,
+                    "prompt_fraction": sampled_fraction,
+                }
+            else:
+                prefix_len = int(raw_task["prompt_duration"])
+                total_duration = prefix_len + int(raw_task["target_duration"])
+                raw_condition = raw_task["prompt_wav"]
+                sequence_tokens = torch.cat([raw_task["prompt_token"], raw_task["target_token"]])
+                reference_audio_path = raw_task["prompt_wav_path"]
+                task = {
+                    **raw_task,
+                    "total_duration": total_duration,
+                    "prompt_fraction": prefix_len / total_duration,
+                }
+
+            anchor_audio = raw_condition.to(device)
+            anchor_tokens = (
+                raw_task["speech_token"]
+                if args.data_mode == "self_prefix"
+                else raw_task["prompt_token"]
+            ).to(device)
+            schedule_generator = torch.Generator(device="cpu")
+            schedule_generator.manual_seed(args.seed + update * 1_000_003 + data_index * 97)
+            rollout_steps_min = args.rollout_steps_min or args.steps
+            rollout_steps = int(torch.randint(
+                rollout_steps_min,
+                args.steps + 1,
+                (1,),
+                generator=schedule_generator,
+            ).item())
+            window_size = min(args.sde_window_size, rollout_steps)
+            window_start = None
+            if window_size > 0:
+                max_start = min(args.sde_window_start_max, rollout_steps - window_size)
+                min_start = min(args.sde_window_start_min, max_start)
+                window_start = int(torch.randint(
+                    min_start,
+                    max_start + 1,
+                    (1,),
+                    generator=schedule_generator,
+                ).item())
+
+            prompt_rms = torch.sqrt(torch.mean(raw_condition.square())).item()
+            prompt_gain = (
+                args.target_rms / max(prompt_rms, 1e-8)
+                if prompt_rms < args.target_rms
+                else 1.0
+            )
+            condition_audio = (raw_condition * prompt_gain).to(device)
+            sequence_tokens = sequence_tokens.to(device)
+            with torch.no_grad():
+                speaker_base = speaker_extractor.extract(raw_condition, device=device)
+            speaker = speaker_base.unsqueeze(0).repeat(local_samples, 1)
+            microbatch_size = rollout_microbatch_size(
+                local_samples=local_samples,
+                duration=total_duration,
+                frame_len=policy.wav_frame_len,
+                frame_budget=args.batch_size_frames,
+            )
+            if local_samples >= 3 and microbatch_size < 3:
+                required_frames = 3 * max(
+                    1, (total_duration + policy.wav_frame_len - 1) // policy.wav_frame_len
+                )
+                raise ValueError(
+                    "Rollout microbatch is smaller than 3 samples. "
+                    f"Increase --batch-size-frames to at least {required_frames} "
+                    f"(current {args.batch_size_frames})."
+                )
+
+            policy.eval()
+            with torch.no_grad(), autocast_context(device, compute_dtype):
+                rollout_parts = []
+                for start in range(0, local_samples, microbatch_size):
+                    end = min(start + microbatch_size, local_samples)
+                    count = end - start
+                    rollout_parts.append(
+                        rollout_sde(
+                            policy,
+                            cond=condition_audio.unsqueeze(0).repeat(count, 1),
+                            speech_tokens=sequence_tokens.unsqueeze(0).repeat(count, 1),
+                            prompt_lens=torch.full((count,), prefix_len, device=device, dtype=torch.long),
+                            durations=torch.full((count,), total_duration, device=device, dtype=torch.long),
+                            spk_embedding=speaker[start:end],
+                            steps=rollout_steps,
+                            noise_scale=args.noise_scale,
+                            cfg_strength=args.cfg_strength,
+                            timestep_mapping=args.timestep_mapping,
+                            timestep_power=args.timestep_power,
+                            sway_sampling_coef=args.sway_sampling_coef,
+                            shift=args.shift,
+                            sde_window_start=window_start,
+                            sde_window_size=window_size,
+                        )
+                    )
+                rollout = concatenate_rollouts(rollout_parts)
+                old_log_probs = rollout_log_probs(rollout)
+
+            generated_paths = save_rollout_audio(
+                rollout,
+                task=task,
+                output_dir=output_dir,
+                update=update,
+                sample_rate=int(policy.target_sample_rate),
+                keep=args.keep_rollouts,
+                output_gain=1.0 / prompt_gain,
+                rank=rank,
+            )
+            reward_target_text = (
+                task.get("prompt_text", "")
+                if args.data_mode == "self_prefix"
+                else task.get("target_text", "")
+            )
+            reward_result = rewarder.score(
+                generated_paths=generated_paths,
+                prompt_paths=[reference_audio_path] * local_samples,
+                target_texts=[reward_target_text] * local_samples,
+                languages=[task.get("language")] * local_samples,
+            )
+            local_metrics = torch.stack(
+                [
+                    reward_result["wer_reward"].to(device),
+                    reward_result["sim_reward"].to(device),
+                    reward_result["mos_reward"].to(device),
+                    reward_result["wer"].to(device),
+                    reward_result["sim"].to(device),
+                    reward_result["mos"].to(device),
+                ],
+                dim=1,
+            )
+            records.append(
+                {
+                    "data_index": data_index,
+                    "task": task,
+                    "rollout": rollout,
+                    "old_log_probs": old_log_probs,
+                    "speaker": speaker,
+                    "microbatch_size": microbatch_size,
+                    "generated_paths": generated_paths,
+                    "reward_result": reward_result,
+                    "local_metrics": local_metrics,
+                    "anchor_audio": anchor_audio,
+                    "anchor_tokens": anchor_tokens,
+                    "anchor_speaker": speaker_base,
+                    "rollout_steps": rollout_steps,
+                    "sde_window_start": window_start,
+                }
+            )
+
+        local_metrics = torch.cat([record["local_metrics"] for record in records], dim=0)
+        gathered_metrics = gather_equal_tensors(local_metrics, world_size)
+        group_metrics = gathered_metrics.view(world_size, len(records), local_samples, 6)
+        group_metrics = group_metrics.permute(1, 0, 2, 3).contiguous()
+        reward_components = group_metrics[..., :3].reshape(-1, 3)
+        reward_weights = torch.tensor(
+            [args.wer_weight, args.sim_weight, args.mos_weight],
+            device=device,
+            dtype=torch.float32,
+        )
+        fused_rewards, reward_component_means, reward_component_stds = normalize_and_fuse_rewards(
+            reward_components,
+            reward_weights,
+            args.reward_std_eps,
+        )
+        fused_by_group = fused_rewards.view(len(records), world_size, local_samples)
+        for group_index, record in enumerate(records):
+            group_global = group_metrics[group_index]
+            global_rewards = fused_by_group[group_index].reshape(-1)
+            global_wers, global_sims, global_mos = group_global[..., 3:].reshape(-1, 3).unbind(dim=1)
+            rewards = fused_by_group[group_index, rank]
+            record["reward_result"]["reward"] = rewards.detach().cpu()
+            advantages = (rewards - global_rewards.mean()) / global_rewards.std(unbiased=False).clamp_min(1e-4)
+            if args.adv_clip_max > 0:
+                advantages = advantages.clamp(-args.adv_clip_max, args.adv_clip_max)
+            record["advantages"] = advantages
+            record["global_rewards"] = global_rewards
+            record["global_wers"] = global_wers
+            record["global_sims"] = global_sims
+            record["global_mos"] = global_mos
+            save_rollout_metrics(
+                generated_paths=record["generated_paths"],
+                reward_result=record["reward_result"],
+                advantages=advantages,
+                global_rewards=global_rewards,
+                global_wers=global_wers,
+                global_sims=global_sims,
+                global_mos=global_mos,
+                reward_component_stds=reward_component_stds,
+                task=record["task"],
+                output_dir=output_dir,
+                update=update,
+                rank=rank,
+                world_size=world_size,
+            )
+
+        policy.train()
+        last_loss = torch.zeros((), device=device)
+        last_policy_loss = torch.zeros((), device=device)
+        last_kl = torch.zeros((), device=device)
+        last_ratio_mean = torch.ones((), device=device)
+        last_ratio_std = torch.zeros((), device=device)
+        last_clipfrac = torch.zeros((), device=device)
+        last_approx_kl = torch.zeros((), device=device)
+        last_grad_norm = torch.zeros((), device=device)
+        last_anchor_loss = torch.zeros((), device=device)
+        last_anchor_flow = torch.zeros((), device=device)
+        last_anchor_mel = torch.zeros((), device=device)
+        last_anchor_repa = torch.zeros((), device=device)
+        last_anchor_stft = torch.zeros((), device=device)
+        for record in records:
+            active_steps = record["rollout"].train_step_indices
+            keep_steps = max(1, round(len(active_steps) * args.train_timestep_fraction))
+            record["train_step_indices"] = active_steps[:keep_steps]
+        num_steps = max(len(record["train_step_indices"]) for record in records)
+        for _ in range(args.ppo_epochs):
+            optimizer.zero_grad(set_to_none=True)
+            loss_total = torch.zeros((), device=device)
+            policy_loss_total = torch.zeros((), device=device)
+            kl_loss_total = torch.zeros((), device=device)
+            ratio_mean_total = torch.zeros((), device=device)
+            ratio_sq_total = torch.zeros((), device=device)
+            clipfrac_total = torch.zeros((), device=device)
+            approx_kl_total = torch.zeros((), device=device)
+            for step_position in range(num_steps):
+                for record in records:
+                    if step_position >= len(record["train_step_indices"]):
+                        continue
+                    step_idx = record["train_step_indices"][step_position]
+                    microbatch_size = record["microbatch_size"]
+                    local_count = local_samples
+                    for start in range(0, local_count, microbatch_size):
+                        end = min(start + microbatch_size, local_count)
+                        batch_rollout = slice_rollout(record["rollout"], start, end)
+                        batch_speaker = record["speaker"][start:end]
+                        batch_advantages = record["advantages"][start:end]
+                        batch_weight = (end - start) / (local_count * len(records))
+                        reference_mean = None
+                        if args.kl_coef > 0.0:
+                            with torch.no_grad(), autocast_context(device, compute_dtype):
+                                if using_lora:
+                                    with lora_disabled(policy):
+                                        _, reference_mean = replay_log_prob_step(
+                                            policy, batch_rollout, step_idx,
+                                            spk_embedding=batch_speaker,
+                                            cfg_strength=args.cfg_strength, return_mean=True,
+                                        )
+                                else:
+                                    _, reference_mean = replay_log_prob_step(
+                                        reference, batch_rollout, step_idx,
+                                        spk_embedding=batch_speaker,
+                                        cfg_strength=args.cfg_strength, return_mean=True,
+                                    )
+                        with autocast_context(device, compute_dtype):
+                            new_log_prob, new_mean = replay_log_prob_step(
+                                policy, batch_rollout, step_idx,
+                                spk_embedding=batch_speaker,
+                                cfg_strength=args.cfg_strength,
+                                return_mean=args.kl_coef > 0.0,
+                            )
+                            old_log_prob = record["old_log_probs"][step_idx, start:end]
+                            ratio = torch.exp((new_log_prob - old_log_prob).clamp(-20.0, 20.0))
+                            clipped_ratio = ratio.clamp(1.0 - args.clip_eps, 1.0 + args.clip_eps)
+                            policy_loss = -torch.minimum(
+                                ratio * batch_advantages,
+                                clipped_ratio * batch_advantages,
+                            ).mean()
+                            kl_loss = torch.zeros((), device=device)
+                            if args.kl_coef > 0.0:
+                                kl_loss = gaussian_mean_kl(
+                                    new_mean.unsqueeze(0), reference_mean.unsqueeze(0),
+                                    batch_rollout.stds[step_idx : step_idx + 1],
+                                    batch_rollout.action_mask,
+                                ).mean()
+                            loss = policy_loss + args.kl_coef * kl_loss
+                        (loss * batch_weight / num_steps).backward()
+                        loss_total += loss.detach() * batch_weight
+                        policy_loss_total += policy_loss.detach() * batch_weight
+                        kl_loss_total += kl_loss.detach() * batch_weight
+                        ratio_mean_total += ratio.detach().mean() * batch_weight
+                        ratio_sq_total += ratio.detach().square().mean() * batch_weight
+                        clipfrac_total += (torch.abs(ratio.detach() - 1.0) > args.clip_eps).float().mean() * batch_weight
+                        approx_kl_total += 0.5 * (new_log_prob.detach() - old_log_prob).square().mean() * batch_weight
+            anchor_loss_total = torch.zeros((), device=device)
+            anchor_parts = {
+                "flow_loss": torch.zeros((), device=device),
+                "aux_mel_loss": torch.zeros((), device=device),
+                "repa_loss": torch.zeros((), device=device),
+                "stft_loss": torch.zeros((), device=device),
+            }
+            if args.sft_anchor_coef > 0:
+                for record in records:
+                    anchor_audio = record["anchor_audio"].unsqueeze(0)
+                    anchor_lens = torch.tensor(
+                        [anchor_audio.shape[1]], device=device, dtype=torch.long
+                    )
+                    teacher_features = teacher_mask = None
+                    if repa_teacher is not None:
+                        with torch.no_grad():
+                            teacher_features, teacher_mask = repa_teacher(anchor_audio, anchor_lens)
+                    with autocast_context(device, compute_dtype):
+                        anchor_loss, _, _, loss_parts = policy(
+                            anchor_audio,
+                            None,
+                            speech_tokens=record["anchor_tokens"].unsqueeze(0),
+                            spk_embedding=record["anchor_speaker"].unsqueeze(0),
+                            lens=anchor_lens,
+                            repa_teacher_features=teacher_features,
+                            repa_teacher_mask=teacher_mask,
+                            global_update=update,
+                        )
+                    (args.sft_anchor_coef * anchor_loss / len(records)).backward()
+                    anchor_loss_total += anchor_loss.detach() / len(records)
+                    for key in anchor_parts:
+                        anchor_parts[key] += loss_parts[key].detach() / len(records)
+            average_gradients(policy, world_size)
+            last_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, args.max_grad_norm).detach()
+            optimizer.step()
+            scheduler.step()
+            last_loss = loss_total / num_steps + args.sft_anchor_coef * anchor_loss_total
+            last_policy_loss = policy_loss_total / num_steps
+            last_kl = kl_loss_total / num_steps
+            last_ratio_mean = ratio_mean_total / num_steps
+            last_ratio_std = (ratio_sq_total / num_steps - last_ratio_mean.square()).clamp_min(0.0).sqrt()
+            last_clipfrac = clipfrac_total / num_steps
+            last_approx_kl = approx_kl_total / num_steps
+            last_anchor_loss = anchor_loss_total
+            last_anchor_flow = anchor_parts["flow_loss"]
+            last_anchor_mel = anchor_parts["aux_mel_loss"]
+            last_anchor_repa = anchor_parts["repa_loss"]
+            last_anchor_stft = anchor_parts["stft_loss"]
+
+        if not args.keep_rollouts:
+            for record in records:
+                for path in record["generated_paths"]:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+        all_raw_metrics = group_metrics[..., 3:].reshape(-1, 3)
+        return {
+            "data_indices": data_indices,
+            "utts": [record["task"]["utt"] for record in records],
+            "prompt_fraction": [float(record["task"]["prompt_fraction"]) for record in records],
+            "prompt_duration": [int(record["task"]["prompt_duration"]) for record in records],
+            "total_duration": [int(record["task"]["total_duration"]) for record in records],
+            "microbatch_sizes": [record["microbatch_size"] for record in records],
+            "rollout_steps": [record["rollout_steps"] for record in records],
+            "sde_window_starts": [record["sde_window_start"] for record in records],
+            "loss": last_loss,
+            "policy_loss": last_policy_loss,
+            "kl": last_kl,
+            "ratio_mean": last_ratio_mean,
+            "ratio_std": last_ratio_std,
+            "clipfrac": last_clipfrac,
+            "approx_kl": last_approx_kl,
+            "grad_norm": last_grad_norm,
+            "learning_rate": torch.tensor(optimizer.param_groups[0]["lr"], device=device),
+            "anchor_loss": last_anchor_loss,
+            "anchor_flow_loss": last_anchor_flow,
+            "anchor_mel_loss": last_anchor_mel,
+            "anchor_repa_loss": last_anchor_repa,
+            "anchor_stft_loss": last_anchor_stft,
+            "reward": fused_rewards.mean(),
+            "wer": all_raw_metrics[:, 0].mean(),
+            "sim": all_raw_metrics[:, 1].mean(),
+            "mos": all_raw_metrics[:, 2].mean(),
+            "reward_std": fused_rewards.std(unbiased=False),
+            "wer_std": all_raw_metrics[:, 0].std(unbiased=False),
+            "sim_std": all_raw_metrics[:, 1].std(unbiased=False),
+            "mos_std": all_raw_metrics[:, 2].std(unbiased=False),
+            "wer_reward_batch_std": reward_component_stds[0],
+            "sim_reward_batch_std": reward_component_stds[1],
+            "mos_reward_batch_std": reward_component_stds[2],
+        }
+
     try:
         update_iter = tqdm(
             range(start_update + 1, args.max_updates + 1),
@@ -752,6 +1245,96 @@ def main():
         for update in update_iter:
             if str(device).startswith("cuda"):
                 torch.cuda.reset_peak_memory_stats(device)
+            if args.prompts_per_update >= 1:
+                batch_start = (update - 1) * args.prompts_per_update
+                batch_indices = []
+                for absolute_position in range(
+                    batch_start, batch_start + args.prompts_per_update
+                ):
+                    data_epoch, data_position = divmod(absolute_position, len(dataset))
+                    if data_epoch != shuffle_epoch:
+                        order_generator = torch.Generator(device="cpu")
+                        order_generator.manual_seed(args.seed + data_epoch)
+                        shuffled_indices = torch.randperm(
+                            len(dataset), generator=order_generator
+                        ).tolist()
+                        shuffle_epoch = data_epoch
+                    batch_indices.append(shuffled_indices[data_position])
+                batch_log = run_multi_prompt_update(update, batch_indices)
+                if str(device).startswith("cuda"):
+                    peak_memory = torch.tensor(
+                        [
+                            torch.cuda.max_memory_allocated(device),
+                            torch.cuda.max_memory_reserved(device),
+                        ],
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    if world_size > 1:
+                        dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
+                    peak_allocated_gib = float(peak_memory[0].item() / 1024**3)
+                    peak_reserved_gib = float(peak_memory[1].item() / 1024**3)
+                else:
+                    peak_allocated_gib = 0.0
+                    peak_reserved_gib = 0.0
+                log_values = {
+                    "update": update,
+                    "rank": rank,
+                    "data_indices": batch_log["data_indices"],
+                    "utts": batch_log["utts"],
+                    "prompt_fraction": batch_log["prompt_fraction"],
+                    "prompt_duration": batch_log["prompt_duration"],
+                    "total_duration": batch_log["total_duration"],
+                    "microbatch_sizes": batch_log["microbatch_sizes"],
+                    "rollout_steps": batch_log["rollout_steps"],
+                    "sde_window_starts": batch_log["sde_window_starts"],
+                    "prompts_per_update": args.prompts_per_update,
+                    "loss": float(batch_log["loss"].item()),
+                    "policy_loss": float(batch_log["policy_loss"].item()),
+                    "kl": float(batch_log["kl"].item()),
+                    "reward": float(batch_log["reward"].item()),
+                    "wer": float(batch_log["wer"].item()),
+                    "sim": float(batch_log["sim"].item()),
+                    "mos": float(batch_log["mos"].item()),
+                    "reward_std": float(batch_log["reward_std"].item()),
+                    "wer_std": float(batch_log["wer_std"].item()),
+                    "sim_std": float(batch_log["sim_std"].item()),
+                    "mos_std": float(batch_log["mos_std"].item()),
+                    "wer_reward_batch_std": float(batch_log["wer_reward_batch_std"].item()),
+                    "sim_reward_batch_std": float(batch_log["sim_reward_batch_std"].item()),
+                    "mos_reward_batch_std": float(batch_log["mos_reward_batch_std"].item()),
+                    "anchor_loss": float(batch_log["anchor_loss"].item()),
+                    "anchor_flow_loss": float(batch_log["anchor_flow_loss"].item()),
+                    "anchor_mel_loss": float(batch_log["anchor_mel_loss"].item()),
+                    "anchor_repa_loss": float(batch_log["anchor_repa_loss"].item()),
+                    "anchor_stft_loss": float(batch_log["anchor_stft_loss"].item()),
+                    "ratio_mean": float(batch_log["ratio_mean"].item()),
+                    "ratio_std": float(batch_log["ratio_std"].item()),
+                    "clipfrac": float(batch_log["clipfrac"].item()),
+                    "approx_kl": float(batch_log["approx_kl"].item()),
+                    "grad_norm": float(batch_log["grad_norm"].item()),
+                    "learning_rate": float(batch_log["learning_rate"].item()),
+                    "peak_allocated_gib": peak_allocated_gib,
+                    "peak_reserved_gib": peak_reserved_gib,
+                }
+                if is_main:
+                    print(json.dumps(log_values, ensure_ascii=False), flush=True)
+                if is_main and update % args.save_per_updates == 0:
+                    save_checkpoint(
+                        output_dir / f"model_{update}.pt",
+                        model=policy,
+                        optimizer=optimizer,
+                        update=update,
+                        args=args,
+                    )
+                    save_checkpoint(
+                        output_dir / "model_last.pt",
+                        model=policy,
+                        optimizer=optimizer,
+                        update=update,
+                        args=args,
+                    )
+                continue
             data_epoch, data_position = divmod(update - 1, len(dataset))
             if data_epoch != shuffle_epoch:
                 order_generator = torch.Generator(device="cpu")
@@ -880,7 +1463,17 @@ def main():
                 languages=[task.get("language")] * local_samples,
             )
             rewards = reward_result["reward"].to(device)
-            global_rewards = gather_equal_tensors(rewards, world_size)
+            local_metrics = torch.stack(
+                [
+                    rewards,
+                    reward_result["wer"].to(device),
+                    reward_result["sim"].to(device),
+                ],
+                dim=1,
+            )
+            global_rewards, global_wers, global_sims = gather_equal_tensors(
+                local_metrics, world_size
+            ).unbind(dim=1)
             advantages = (
                 (rewards - global_rewards.mean())
                 / global_rewards.std(unbiased=False).clamp_min(1e-4)
@@ -892,6 +1485,8 @@ def main():
                 reward_result=reward_result,
                 advantages=advantages,
                 global_rewards=global_rewards,
+                global_wers=global_wers,
+                global_sims=global_sims,
                 task=task,
                 output_dir=output_dir,
                 update=update,
@@ -1048,9 +1643,11 @@ def main():
                 "policy_loss": float(last_policy_loss.item()),
                 "kl": float(last_kl.item()),
                 "reward": float(global_rewards.mean().item()),
-                "wer": float(reward_result["wer"].mean().item()),
-                "sim": float(reward_result["sim"].mean().item()),
+                "wer": float(global_wers.mean().item()),
+                "sim": float(global_sims.mean().item()),
                 "reward_std": float(global_rewards.std(unbiased=False).item()),
+                "wer_std": float(global_wers.std(unbiased=False).item()),
+                "sim_std": float(global_sims.std(unbiased=False).item()),
                 "ratio_mean": float(last_ratio_mean.item()),
                 "ratio_std": float(last_ratio_std.item()),
                 "clipfrac": float(last_clipfrac.item()),
@@ -1069,6 +1666,8 @@ def main():
                         log_values["wer"],
                         log_values["sim"],
                         log_values["reward_std"],
+                        log_values["wer_std"],
+                        log_values["sim_std"],
                         log_values["ratio_mean"],
                         log_values["ratio_std"],
                         log_values["clipfrac"],
@@ -1089,11 +1688,13 @@ def main():
                         "wer": float(stats[4].item()),
                         "sim": float(stats[5].item()),
                         "reward_std": float(stats[6].item()),
-                        "ratio_mean": float(stats[7].item()),
-                        "ratio_std": float(stats[8].item()),
-                        "clipfrac": float(stats[9].item()),
-                        "approx_kl": float(stats[10].item()),
-                        "grad_norm": float(stats[11].item()),
+                        "wer_std": float(stats[7].item()),
+                        "sim_std": float(stats[8].item()),
+                        "ratio_mean": float(stats[9].item()),
+                        "ratio_std": float(stats[10].item()),
+                        "clipfrac": float(stats[11].item()),
+                        "approx_kl": float(stats[12].item()),
+                        "grad_norm": float(stats[13].item()),
                     }
                 )
             if is_main:

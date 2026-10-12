@@ -68,6 +68,16 @@ def build_parser():
     parser.add_argument("--prompt-fraction-min", type=float, default=0.0)
     parser.add_argument("--prompt-fraction-max", type=float, default=0.3)
     parser.add_argument(
+        "--prefix-seed",
+        type=int,
+        default=None,
+        help=(
+            "Stable seed for self-prefix length sampling. If omitted, the "
+            "training seed is used. The sampled prefix is shared by every "
+            "rollout in the same GRPO group."
+        ),
+    )
+    parser.add_argument(
         "--batch-size-frame",
         "--batch-size-frames",
         dest="batch_size_frames",
@@ -476,6 +486,7 @@ def save_rollout_audio(
     keep: bool,
     output_gain: float = 1.0,
     rank: int = 0,
+    reconstruct_full: bool = False,
 ) -> list[str]:
     rollout_dir = output_dir / "rollouts" / f"update_{update:08d}" / f"rank_{rank:04d}"
     if keep:
@@ -487,8 +498,22 @@ def save_rollout_audio(
     paths = []
     safe_utt = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task["utt"])).strip("._") or "sample"
     for sample_idx, duration in enumerate(rollout.durations.tolist()):
-        audio = rollout.final[sample_idx, prompt_len:int(duration)].float().cpu()
-        audio = audio * float(output_gain)
+        duration = int(duration)
+        generated = rollout.final[sample_idx, prompt_len:duration].float().cpu()
+        generated = generated * float(output_gain)
+        if reconstruct_full:
+            # self_prefix predicts only the suffix, but reward models must see
+            # the same full utterance layout as F5R-TTS: original prefix plus
+            # generated suffix. Keep the prefix unscaled because it is the
+            # reference waveform; output_gain only reverses prompt RMS scaling
+            # applied to the generated region during rollout.
+            source = task.get("audio")
+            if source is None:
+                raise ValueError("reconstruct_full requires task['audio']")
+            prefix = source[:prompt_len].float().cpu()
+            audio = torch.cat([prefix, generated], dim=0)
+        else:
+            audio = generated
         if audio.numel() == 0:
             audio = torch.zeros(1)
         path = rollout_dir / f"{safe_utt}__rank{rank}__sample{sample_idx}.wav"
@@ -607,6 +632,10 @@ def save_rollout_metrics(
 
 def main():
     args = parse_args()
+    if args.prefix_seed is None:
+        # Preserve the historical behavior for existing paired/self-prefix
+        # experiments while allowing dedicated runs to pin prefix sampling.
+        args.prefix_seed = args.seed
     # The switches are authoritative so that a config cannot accidentally run
     # a different training regime just because a numeric value was left over.
     if not args.use_cfg:
@@ -829,6 +858,7 @@ def main():
             f"target_rms={args.target_rms} kl={args.kl_coef} "
             f"reward_backend={args.reward_backend} data_mode={args.data_mode} "
             f"prefix=[{args.prompt_fraction_min},{args.prompt_fraction_max}] "
+            f"prefix_seed={args.prefix_seed} "
             f"batch_frames={args.batch_size_frames} "
             f"train_timestep_fraction={args.train_timestep_fraction} "
             f"reward_weights=({args.wer_weight},{args.sim_weight},{args.mos_weight}) "
@@ -851,7 +881,7 @@ def main():
                     frame_len=policy.wav_frame_len,
                     min_fraction=args.prompt_fraction_min,
                     max_fraction=args.prompt_fraction_max,
-                    seed=args.seed + update * 1_000_003 + data_index,
+                    seed=args.prefix_seed + update * 1_000_003 + data_index,
                 )
                 raw_condition = raw_task["audio"]
                 sequence_tokens = raw_task["speech_token"]
@@ -968,6 +998,7 @@ def main():
                 keep=args.keep_rollouts,
                 output_gain=1.0 / prompt_gain,
                 rank=rank,
+                reconstruct_full=args.data_mode == "self_prefix",
             )
             reward_target_text = (
                 task.get("prompt_text", "")
@@ -1353,7 +1384,7 @@ def main():
                     frame_len=policy.wav_frame_len,
                     min_fraction=args.prompt_fraction_min,
                     max_fraction=args.prompt_fraction_max,
-                    seed=args.seed + update * 1_000_003 + data_index,
+                    seed=args.prefix_seed + update * 1_000_003 + data_index,
                 )
                 raw_condition = task["audio"]
                 sequence_tokens = task["speech_token"]
@@ -1448,9 +1479,10 @@ def main():
                 keep=args.keep_rollouts,
                 output_gain=1.0 / prompt_gain,
                 rank=rank,
+                reconstruct_full=args.data_mode == "self_prefix",
             )
-            # self_prefix predicts the latter part of prompt_wav, so use the
-            # prompt transcript as the WER reference for every generated wav.
+            # self_prefix rewards the reconstructed full utterance (original
+            # prefix plus generated suffix) against its full prompt transcript.
             reward_target_text = (
                 task.get("prompt_text", "")
                 if args.data_mode == "self_prefix"

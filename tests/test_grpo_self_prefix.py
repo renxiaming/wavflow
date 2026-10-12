@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 from wavtts.model.grpo_dataset import PromptTargetJsonl, sample_prefix_length
 from wavtts.model.grpo_flow import _sde_parameters, _time_grid, prepare_flow_inputs
 from wavtts.rewards import SimWerReward
-from wavtts.train.train_grpo import normalize_and_fuse_rewards
+from wavtts.train.train_grpo import normalize_and_fuse_rewards, save_rollout_audio
 
 
 def test_flow_grpo_default_uses_paired_prompt_target():
@@ -102,6 +102,36 @@ def test_prefix_sampling_is_stable_and_frame_aligned():
     assert first == second
     assert first[0] % 160 == 0
     assert 0 <= first[0] < 4_800
+
+
+def test_self_prefix_reward_audio_reconstructs_original_prefix(tmp_path):
+    task = {
+        "utt": "sample",
+        "prompt_duration": 4,
+        "audio": torch.tensor([0.1, 0.2, 0.3, 0.4, 9.0, 9.0]),
+    }
+    rollout = type(
+        "Rollout",
+        (),
+        {
+            "durations": torch.tensor([6]),
+            "final": torch.tensor([[1.0, 2.0, 3.0, 4.0, 0.25, 0.3]]),
+        },
+    )()
+
+    [path] = save_rollout_audio(
+        rollout,
+        task=task,
+        output_dir=tmp_path,
+        update=1,
+        sample_rate=16_000,
+        keep=True,
+        output_gain=2.0,
+        reconstruct_full=True,
+    )
+    saved, sample_rate = torchaudio.load(path)
+    assert sample_rate == 16_000
+    assert torch.allclose(saved[0], torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]))
 
 
 class _DummyModel(torch.nn.Module):
